@@ -29,6 +29,8 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from typing import Any, Callable, Optional
 
 try:
@@ -277,7 +279,7 @@ class VFS:
 
     def __init__(self) -> None:
         self.root = FileNode(kind="dir", owner="root", group="root", mode=0o755)
-        self.cwd: list[str] = ["home", "user"]
+        self.cwd: list[str] = ["home", "guest"]
         # Хуки, устанавливаются Kernel'ом после сборки всех подсистем
         self._perm_checker: Optional[Callable[[FileNode, str], bool]] = None
         self._current_user_fn: Callable[[], str] = lambda: "user"
@@ -333,7 +335,7 @@ class VFS:
             return
         try:
             self.root = FileNode.from_json(root)
-            cwd = state.get("cwd", ["home", "user"])
+            cwd = state.get("cwd", ["home", "guest"])
             if isinstance(cwd, list) and all(isinstance(p, str) for p in cwd):
                 self.cwd = cwd
         except Exception:
@@ -360,7 +362,7 @@ class VFS:
         """Возвращает узел с разрешением симлинков (с ограничением глубины)."""
         node = self.root
         hops = 0
-        for p in parts:
+        for index, p in enumerate(parts):
             if node.kind != "dir" or p not in node.children:
                 return None
             node = node.children[p]
@@ -372,8 +374,17 @@ class VFS:
                 if target.startswith("/"):
                     new_parts = [x for x in target.split("/") if x]
                 else:
-                    # относительные резолвим от cwd (упрощение)
-                    new_parts = self.resolve(target)
+                    # Относительная ссылка разрешается от каталога самой ссылки,
+                    # а не от текущего каталога оболочки.
+                    new_parts = list(parts[:index])
+                    for component in target.split("/"):
+                        if component in ("", "."):
+                            continue
+                        if component == "..":
+                            if new_parts:
+                                new_parts.pop()
+                        else:
+                            new_parts.append(component)
                 node = self.root
                 broken = False
                 for np in new_parts:
@@ -1061,34 +1072,198 @@ class PackageManager:
     def __init__(self, kernel: "Kernel") -> None:
         self.kernel = kernel
         self.installed: set[str] = set()
+        self.repo_url = ""
+        self.remote_registry: dict[str, dict] = {}
+        self.commands: dict[str, dict] = {}
+        self.apps: dict[str, dict] = {}
+
+    def export_extensions(self) -> dict:
+        return {"commands": self.commands, "apps": self.apps}
+
+    def import_extensions(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        commands = data.get("commands", {})
+        apps = data.get("apps", {})
+        if isinstance(commands, dict):
+            self.commands = commands
+        if isinstance(apps, dict):
+            self.apps = apps
+
+    @staticmethod
+    def _valid_name(name: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name))
+
+    def catalog(self) -> dict[str, dict]:
+        catalog = dict(self.REGISTRY)
+        catalog.update(self.remote_registry)
+        return catalog
+
+    def set_repo(self, url: str) -> None:
+        url = url.strip()
+        if not re.match(r"https://", url) and not re.match(r"http://localhost(?::\d+)?/", url):
+            raise PyOSError("репозиторий должен использовать HTTPS (или localhost для тестов)")
+        self.repo_url = url
+
+    def update(self, url: Optional[str] = None) -> int:
+        target = (url or self.repo_url).strip()
+        if not target:
+            raise PyOSError("репозиторий не задан: pkg repo <https-url>")
+        self.set_repo(target)
+        try:
+            with urllib.request.urlopen(target, timeout=8) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+        except (OSError, urllib.error.URLError) as e:
+            raise PyOSError(f"не удалось обновить репозиторий: {e}") from None
+        if len(raw) > 2 * 1024 * 1024:
+            raise PyOSError("индекс репозитория слишком большой")
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise PyOSError("репозиторий вернул некорректный JSON") from None
+        packages = data.get("packages") if isinstance(data, dict) else None
+        if not isinstance(packages, dict):
+            raise PyOSError("индекс должен содержать объект packages")
+        checked = {}
+        for name, info in packages.items():
+            if not self._valid_name(str(name)) or not isinstance(info, dict):
+                continue
+            desc = str(info.get("desc", "Без описания"))[:300]
+            version = str(info.get("version", "0.0.0"))[:32]
+            files = info.get("files", {})
+            if not isinstance(files, dict):
+                files = {}
+            safe_files = {}
+            for path, content in files.items():
+                path = str(path)
+                if (not path or path.startswith("/") or ".." in path.split("/")
+                        or len(path) > 160 or not isinstance(content, str)):
+                    continue
+                safe_files[path] = content[:512 * 1024]
+            checked[str(name)] = {"desc": desc, "version": version,
+                                  "size": int(info.get("size", 0) or 0),
+                                  "provides": list(info.get("provides", []))[:32],
+                                  "files": safe_files}
+        self.remote_registry = checked
+        return len(checked)
 
     def list_installed(self) -> list[str]:
         return sorted(self.installed)
 
     def search(self, query: str) -> list[tuple[str, str]]:
         q = query.lower()
-        return [(n, d["desc"]) for n, d in self.REGISTRY.items()
+        return [(n, d["desc"]) for n, d in self.catalog().items()
                 if q in n or q in d["desc"].lower()]
 
     def install(self, name: str) -> None:
-        if name not in self.REGISTRY:
+        if not self.kernel.users.is_admin():
+            raise PermError("для установки пакетов нужен root")
+        catalog = self.catalog()
+        if name not in catalog:
             raise PyOSError(f"пакет не найден: {name}")
         if name in self.installed:
             raise PyOSError(f"уже установлен: {name}")
         self.kernel.vfs.mkdir_p(f"/usr/pkg/{name}")
-        self.kernel.vfs.write(f"/usr/pkg/{name}/README",
-                              self.REGISTRY[name]["desc"] + "\n", system=True)
+        info = catalog[name]
+        files = info.get("files", {}) if isinstance(info, dict) else {}
+        if not files:
+            files = {"README": info["desc"] + "\n"}
+        manifest = {}
+        if "manifest.json" in files:
+            try:
+                manifest = json.loads(files["manifest.json"])
+            except (TypeError, json.JSONDecodeError):
+                raise PyOSError("manifest.json имеет некорректный JSON") from None
+            if not isinstance(manifest, dict) or manifest.get("name", name) != name:
+                raise PyOSError("manifest.json: неверное имя пакета")
+        new_commands = {}
+        raw_commands = manifest.get("commands", {})
+        if not isinstance(raw_commands, dict) or len(raw_commands) > 32:
+            raise PyOSError("manifest.json: неверный список commands")
+        for command, spec in raw_commands.items():
+            if not self._valid_name(str(command)) or not isinstance(spec, dict):
+                raise PyOSError("manifest.json: неверная команда")
+            output = str(spec.get("output", ""))
+            if len(output) > 20000:
+                raise PyOSError("manifest.json: вывод команды слишком большой")
+            new_commands[str(command)] = {"package": name,
+                                          "description": str(spec.get("description", ""))[:200],
+                                          "output": output}
+        app = manifest.get("app")
+        if app is not None:
+            if not isinstance(app, dict):
+                raise PyOSError("manifest.json: неверное описание app")
+            app = {"package": name, "title": str(app.get("title", name))[:80],
+                   "icon": str(app.get("icon", "📦"))[:8],
+                   "content": str(app.get("content", info.get("desc", "")))[:20000]}
+        for path, content in files.items():
+            parent_parts = path.split("/")[:-1]
+            if parent_parts:
+                self.kernel.vfs.mkdir_p("/usr/pkg/" + name + "/" + "/".join(parent_parts))
+            self.kernel.vfs.write(f"/usr/pkg/{name}/{path}", content, system=True)
         self.installed.add(name)
+        self.commands.update(new_commands)
+        if app is not None:
+            self.apps[name] = app
         self.kernel.bus.emit("pkg_installed", name=name)
 
     def remove(self, name: str) -> None:
+        if not self.kernel.users.is_admin():
+            raise PermError("для удаления пакетов нужен root")
         if name not in self.installed:
             raise PyOSError(f"не установлен: {name}")
         self.installed.discard(name)
+        self.commands = {k: v for k, v in self.commands.items()
+                         if v.get("package") != name}
+        self.apps.pop(name, None)
         try:
             self.kernel.vfs.rm(f"/usr/pkg/{name}", recursive=True, trash=False)
         except VFSError:
             pass
+
+
+# ============================================================
+#                    ДОСТИЖЕНИЯ
+# ============================================================
+class AchievementManager:
+    """Steam-подобные достижения PyOS с сохранением разблокировок."""
+
+    DEFINITIONS = {
+        "welcome": ("Первые шаги", "Запустить игру в PyOS"),
+        "2048_128": ("Сила двойки", "Собрать плитку 128 в 2048"),
+        "2048_2048": ("Мастер 2048", "Собрать плитку 2048"),
+        "snake_10": ("Аппетит приходит", "Набрать 10 очков в Змейке"),
+        "snake_50": ("Змеиный чемпион", "Набрать 50 очков в Змейке"),
+        "tetris_line": ("Первая линия", "Очистить линию в Тетрисе"),
+        "tetris_100": ("Падающий мастер", "Набрать 100 очков в Тетрисе"),
+        "minesweeper_win": ("Сапёр ошибается один раз", "Победить в Сапёре"),
+        "minesweeper_boom": ("Бум!", "Подорваться на мине"),
+    }
+
+    def __init__(self, kernel: "Kernel") -> None:
+        self.kernel = kernel
+        self.unlocked: dict[str, str] = {}
+
+    def load(self, data: Any) -> None:
+        if isinstance(data, dict):
+            self.unlocked = {k: str(v) for k, v in data.items()
+                             if k in self.DEFINITIONS}
+
+    def unlock(self, key: str) -> bool:
+        if key not in self.DEFINITIONS or key in self.unlocked:
+            return False
+        self.unlocked[key] = now_iso()
+        title, description = self.DEFINITIONS[key]
+        message = f"🏆 {title}\n{description}"
+        if self.kernel.desktop_notify:
+            self.kernel.desktop_notify("ДОСТИЖЕНИЕ РАЗБЛОКИРОВАНО", message)
+        else:
+            self.kernel.logger.info(f"achievement unlocked: {title} — {description}")
+        self.kernel.save_state()
+        return True
+
+    def is_unlocked(self, key: str) -> bool:
+        return key in self.unlocked
 
 
 # ============================================================
@@ -1120,13 +1295,18 @@ class Kernel:
         self.icon_scale = 1.0
         self.autosave_enabled = True
         self.show_tooltips = True
+        self.sound_enabled = True
+        self.sound_volume = 0.7
         self.aliases: dict[str, str] = {}
         self.env_vars: dict[str, str] = {}
         self.started = time.time()
         self._stop = False
         self.launcher: Optional[Callable[..., bool]] = None
         self.desktop_notify: Optional[Callable[[str, str], None]] = None
+        self.achievements = AchievementManager(self)
         self._load_state()
+        # Состояние VFS не должно оставлять гостя в домашнем каталоге другого пользователя.
+        self.vfs.cd(self.users.users[self.users.current].home)
         self.scheduler.start()
         self.bus.on("on_boot", lambda **_: self.logger.info("boot complete"))
 
@@ -1144,9 +1324,17 @@ class Kernel:
                 self.icon_scale = max(0.75, min(1.5, float(state.get("icon_scale", self.icon_scale))))
                 self.autosave_enabled = bool(state.get("autosave_enabled", self.autosave_enabled))
                 self.show_tooltips = bool(state.get("show_tooltips", self.show_tooltips))
+                self.sound_enabled = bool(state.get("sound_enabled", self.sound_enabled))
+                self.sound_volume = max(0.0, min(1.0, float(state.get("sound_volume", self.sound_volume))))
                 self.aliases = state.get("aliases", {}) or {}
                 self.packages.installed = set(state.get("packages", []))
+                self.packages.repo_url = str(state.get("package_repo", ""))
+                catalog = state.get("package_catalog", {})
+                if isinstance(catalog, dict):
+                    self.packages.remote_registry = catalog
+                self.packages.import_extensions(state.get("package_extensions", {}))
                 self.env_vars = state.get("env_vars", {}) or {}
+                self.achievements.load(state.get("achievements", {}))
                 return
         except (OSError, ValueError):
             pass
@@ -1178,9 +1366,15 @@ class Kernel:
             "icon_scale": self.icon_scale,
             "autosave_enabled": self.autosave_enabled,
             "show_tooltips": self.show_tooltips,
+            "sound_enabled": self.sound_enabled,
+            "sound_volume": self.sound_volume,
             "aliases": self.aliases,
             "packages": sorted(self.packages.installed),
+            "package_repo": self.packages.repo_url,
+            "package_catalog": self.packages.remote_registry,
+            "package_extensions": self.packages.export_extensions(),
             "env_vars": self.env_vars,
+            "achievements": self.achievements.unlocked,
         }
         directory = os.path.dirname(self.STATE_FILE) or "."
         try:
@@ -1403,6 +1597,12 @@ class Shell:
         cmd, args = parts[0], parts[1:]
         handler = getattr(self, f"cmd_{cmd}", None) if cmd.isidentifier() else None
         if handler is None:
+            package_command = self.k.packages.commands.get(cmd)
+            if package_command:
+                output = package_command.get("output", "")
+                output = output.replace("{args}", " ".join(args))
+                self._print(output)
+                return
             self.err(f"{cmd}: команда не найдена. Введите help.")
             return
         handler(args)
@@ -1653,18 +1853,24 @@ class Shell:
                     self._print(name + suffix)
 
     def cmd_cd(self, args) -> None:
-        self.k.vfs.cd(args[0] if args else None)
+        if args:
+            self.k.vfs.cd(args[0])
+        else:
+            self.k.vfs.cd(self.k.users.users[self.k.users.current].home)
 
     def cmd_mkdir(self, args) -> None:
         if not args:
             self.err("укажите имя")
             return
+        success = False
         for a in args:
             try:
                 self.k.vfs.mkdir(a)
+                success = True
             except (VFSError, PermError) as e:
                 self.err(f"{a}: {e}")
-        self.ok("готово")
+        if success:
+            self.ok("готово")
 
     def cmd_touch(self, args) -> None:
         if not args:
@@ -1955,7 +2161,7 @@ class Shell:
     # ---------- пакеты ----------
     def cmd_pkg(self, args) -> None:
         if not args:
-            self.err("pkg list|search <q>|install <name>|remove <name>")
+            self.err("pkg list|search <q>|repo [url]|update|install <name>|remove <name>")
             return
         sub = args[0]
         try:
@@ -1968,10 +2174,24 @@ class Shell:
             elif sub == "search":
                 for n, d in self.k.packages.search(args[1] if len(args) > 1 else ""):
                     self._print(f"{n:<12}{d}")
+            elif sub == "repo":
+                if len(args) > 1:
+                    self.k.packages.set_repo(args[1])
+                self._print(self.k.packages.repo_url or "(репозиторий не задан)")
+            elif sub == "update":
+                count = self.k.packages.update(args[1] if len(args) > 1 else None)
+                self.k.save_state()
+                self.ok(f"каталог обновлён: {count} пакетов")
             elif sub == "install" and len(args) >= 2:
+                if not self.k.users.is_admin():
+                    self.err("нужен root")
+                    return
                 self.k.packages.install(args[1])
                 self.ok(f"установлен: {args[1]}")
             elif sub == "remove" and len(args) >= 2:
+                if not self.k.users.is_admin():
+                    self.err("нужен root")
+                    return
                 self.k.packages.remove(args[1])
                 self.ok("удалён")
             else:
@@ -2103,10 +2323,12 @@ class Shell:
         ok, msg = self.k.users.login(args[0], args[1] if len(args) > 1 else "")
         (self.ok if ok else self.err)(msg)
         if ok:
+            self.k.vfs.cd(self.k.users.users[self.k.users.current].home)
             self._load_history()
 
     def cmd_logout(self, args) -> None:
         self.k.users.current = "guest"
+        self.k.vfs.cd(self.k.users.users["guest"].home)
         self._load_history()
         self.ok("вы вышли")
 
@@ -2140,10 +2362,16 @@ class Shell:
         if not args:
             self.err("groupadd <name>")
             return
+        if not self.k.users.is_admin():
+            self.err("нужен root")
+            return
         self.k.users.add_group(args[0])
         self.ok("группа создана")
 
     def cmd_usermod(self, args) -> None:
+        if not self.k.users.is_admin():
+            self.err("нужен root")
+            return
         if len(args) >= 3 and args[0] == "-aG":
             self.k.users.add_user_to_group(args[2], args[1])
             self.ok("добавлен в группу")
@@ -2172,6 +2400,9 @@ class Shell:
         if not args:
             self._print("pyos-vfs on / type virtual (rw)")
             return
+        if not self.k.users.is_admin():
+            self.err("нужен root")
+            return
         name = args[0]
         try:
             self.k.vfs.mkdir_p(f"/mnt/{name}")
@@ -2182,6 +2413,9 @@ class Shell:
     def cmd_umount(self, args) -> None:
         if not args:
             self.err("umount <name>")
+            return
+        if not self.k.users.is_admin():
+            self.err("нужен root")
             return
         try:
             self.k.vfs.rm(f"/mnt/{args[0]}", recursive=True, trash=False)
@@ -2740,6 +2974,7 @@ class AppWindow(tk.Toplevel if tk else object):
 
         self.title(title)
         self.configure(bg=BG_WINDOW)
+        self.minsize(360, 260)
         if not NATIVE:
             self.overrideredirect(True)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -2770,6 +3005,12 @@ class AppWindow(tk.Toplevel if tk else object):
 
         self.body = tk.Frame(self, bg=BG_WINDOW)
         self.body.pack(fill="both", expand=True, padx=8, pady=8)
+        if not NATIVE:
+            self.resize_grip = tk.Frame(self, bg=ACCENT, cursor="bottom_right_corner",
+                                        width=12, height=12)
+            self.resize_grip.place(relx=1.0, rely=1.0, anchor="se")
+            self.resize_grip.bind("<Button-1>", self._resize_start)
+            self.resize_grip.bind("<B1-Motion>", self._resize_move)
 
         self._place_default()
         desktop.register_window(self)
@@ -2841,6 +3082,15 @@ class AppWindow(tk.Toplevel if tk else object):
         if self._snapped:
             return
         self.geometry(f"+{e.x_root - self._off[0]}+{e.y_root - self._off[1]}")
+
+    def _resize_start(self, e) -> None:
+        self._resize_origin = (e.x_root, e.y_root, self.winfo_width(), self.winfo_height())
+
+    def _resize_move(self, e) -> None:
+        if self._maximized or not hasattr(self, "_resize_origin"):
+            return
+        sx, sy, sw, sh = self._resize_origin
+        self.geometry(f"{max(360, sw + e.x_root - sx)}x{max(260, sh + e.y_root - sy)}")
 
     def _snap(self, side: str) -> None:
         if self._snapped == side:
@@ -3235,10 +3485,18 @@ def open_settings(desktop, *_) -> None:
              variable=scale_var, bg=BG_WINDOW, highlightthickness=0).grid(row=3, column=1)
     autosave_var = tk.BooleanVar(value=kernel.autosave_enabled)
     tips_var = tk.BooleanVar(value=kernel.show_tooltips)
+    sound_var = tk.BooleanVar(value=kernel.sound_enabled)
+    volume_var = tk.DoubleVar(value=kernel.sound_volume * 100)
     tk.Checkbutton(box, text="Автосохранение", variable=autosave_var,
                    bg=BG_WINDOW).grid(row=4, column=0, columnspan=2, sticky="w")
     tk.Checkbutton(box, text="Показывать подсказки", variable=tips_var,
                    bg=BG_WINDOW).grid(row=5, column=0, columnspan=2, sticky="w")
+    tk.Checkbutton(box, text="Звуки интерфейса", variable=sound_var,
+                   bg=BG_WINDOW).grid(row=6, column=0, columnspan=2, sticky="w")
+    tk.Label(box, text="Громкость:", bg=BG_WINDOW, font=FONT_BOLD).grid(
+        row=7, column=0, sticky="w", pady=4)
+    tk.Scale(box, from_=0, to=100, variable=volume_var, orient="horizontal",
+             bg=BG_WINDOW, highlightthickness=0).grid(row=7, column=1)
 
     def apply():
         kernel.theme = theme_var.get()
@@ -3247,6 +3505,8 @@ def open_settings(desktop, *_) -> None:
         kernel.icon_scale = max(0.75, min(1.5, scale_var.get()))
         kernel.autosave_enabled = autosave_var.get()
         kernel.show_tooltips = tips_var.get()
+        kernel.sound_enabled = sound_var.get()
+        kernel.sound_volume = max(0.0, min(1.0, volume_var.get() / 100.0))
         desktop._apply_wallpaper()
         desktop._last_layout_size = (0, 0)
         desktop.place_icons()
@@ -3260,9 +3520,9 @@ def open_settings(desktop, *_) -> None:
         kernel.save_state()
 
     tk.Button(box, text="Сбросить позиции", command=reset_positions).grid(
-        row=6, column=0, pady=8)
+        row=8, column=0, pady=8)
     tk.Button(box, text="Применить", command=apply).grid(
-        row=6, column=1, pady=8)
+        row=8, column=1, pady=8)
 
 
 def open_market(desktop, *_) -> None:
@@ -3273,9 +3533,10 @@ def open_market(desktop, *_) -> None:
 
     def refresh():
         lb.delete(0, "end")
-        for n, d in PackageManager.REGISTRY.items():
+        for n, d in kernel.packages.catalog().items():
             mark = "✓" if n in kernel.packages.installed else " "
-            lb.insert("end", f"[{mark}] {n:<12} {d['desc']}")
+            version = f" v{d.get('version')}" if d.get("version") else ""
+            lb.insert("end", f"[{mark}] {n:<12}{version} {d['desc']}")
 
     def get_name():
         sel = lb.curselection()
@@ -3304,10 +3565,32 @@ def open_market(desktop, *_) -> None:
             messagebox.showerror("Магазин", str(e), parent=w)
         refresh()
 
+    def update_repo():
+        url = simpledialog.askstring("Репозиторий", "URL JSON-индекса HTTPS:",
+                                     initialvalue=kernel.packages.repo_url, parent=w)
+        if not url:
+            return
+        try:
+            count = kernel.packages.update(url)
+            kernel.save_state()
+            messagebox.showinfo("Магазин", f"Загружено пакетов: {count}", parent=w)
+            refresh()
+        except PyOSError as e:
+            messagebox.showerror("Магазин", str(e), parent=w)
+
+    def launch_app():
+        name = get_name()
+        if name and name in kernel.packages.apps:
+            desktop.launch_from_os("pkg:" + name)
+        elif name:
+            messagebox.showinfo("Магазин", "У этого пакета нет GUI-приложения", parent=w)
+
     bar = tk.Frame(w.body, bg=BG_WINDOW)
     bar.pack(fill="x", pady=(8, 0))
     tk.Button(bar, text="📥 Установить", command=install).pack(side="left")
     tk.Button(bar, text="🗑 Удалить", command=remove).pack(side="left", padx=6)
+    tk.Button(bar, text="🌐 Обновить каталог", command=update_repo).pack(side="left")
+    tk.Button(bar, text="▶ Запустить", command=launch_app).pack(side="left", padx=6)
     refresh()
 
 
@@ -3433,6 +3716,65 @@ def open_files(desktop, *_) -> None:
         panes["left"]["refresh"]()
         panes["right"]["refresh"]()
 
+    def selected_path(side):
+        pane = panes[side]
+        sel = pane["lb"].curselection()
+        if not sel:
+            return None
+        name = pane["lb"].get(sel[0]).rstrip("/@")
+        return ("/" + "/".join(pane["cur"][0])).rstrip("/") + "/" + name
+
+    def go_up(side):
+        pane = panes[side]
+        if pane["cur"][0]:
+            pane["cur"][0] = pane["cur"][0][:-1]
+            pane["refresh"]()
+
+    def new_folder(side):
+        pane = panes[side]
+        name = simpledialog.askstring("Новая папка", "Имя папки:", parent=w)
+        if not name or "/" in name or name in (".", ".."):
+            return
+        path = ("/" + "/".join(pane["cur"][0])).rstrip("/") + "/" + name
+        try:
+            kernel.vfs.mkdir(path)
+            pane["refresh"]()
+        except (VFSError, PermError) as e:
+            messagebox.showerror("Файлы", str(e), parent=w)
+
+    def delete_selected(side):
+        path = selected_path(side)
+        if not path:
+            return
+        if not messagebox.askyesno("Удаление", f"Удалить {path}?", parent=w):
+            return
+        try:
+            kernel.vfs.rm(path, recursive=True)
+            panes[side]["refresh"]()
+        except (VFSError, PermError) as e:
+            messagebox.showerror("Файлы", str(e), parent=w)
+
+    def move_selected(src_side, dst_side):
+        src_path = selected_path(src_side)
+        if not src_path:
+            return
+        src = panes[src_side]
+        dst = panes[dst_side]
+        name = src_path.rsplit("/", 1)[-1]
+        dst_path = ("/" + "/".join(dst["cur"][0])).rstrip("/") + "/" + name
+        try:
+            node = kernel.vfs._get(kernel.vfs.resolve(src_path))
+            if node and node.kind == "dir":
+                messagebox.showinfo("Файлы", "Перемещение папок пока не поддерживается",
+                                    parent=w)
+                return
+            kernel.vfs.write(dst_path, kernel.vfs.read(src_path))
+            kernel.vfs.rm(src_path, trash=False)
+            src["refresh"]()
+            dst["refresh"]()
+        except (VFSError, PermError) as e:
+            messagebox.showerror("Файлы", str(e), parent=w)
+
     bar = tk.Frame(w.body, bg=BG_WINDOW)
     bar.pack(fill="x")
     tk.Button(bar, text="🔄 Обновить",
@@ -3442,6 +3784,12 @@ def open_files(desktop, *_) -> None:
               command=lambda: copy_selected("left", "right")).pack(side="left", padx=4)
     tk.Button(bar, text="→ Копировать",
               command=lambda: copy_selected("right", "left")).pack(side="left")
+    tk.Button(bar, text="↑ Вверх слева", command=lambda: go_up("left")).pack(side="left", padx=4)
+    tk.Button(bar, text="↑ Вверх справа", command=lambda: go_up("right")).pack(side="left")
+    tk.Button(bar, text="＋ Папка", command=lambda: new_folder("left")).pack(side="left", padx=4)
+    tk.Button(bar, text="🗑 Удалить", command=lambda: delete_selected("left")).pack(side="left")
+    tk.Button(bar, text="→ Переместить", command=lambda: move_selected("left", "right")).pack(
+        side="left", padx=4)
 
 
 def open_game(desktop, *_) -> None:
@@ -3594,6 +3942,7 @@ def open_hangman(desktop, *_) -> None:
 
 def open_2048(desktop, *_) -> None:
     w = AppWindow(desktop, "2048", "🔢", mem=8)
+    desktop.os.achievements.unlock("welcome")
     box = centered(w.body)
     grid = tk.Frame(box, bg=BG_WINDOW)
     grid.pack()
@@ -3619,6 +3968,10 @@ def open_2048(desktop, *_) -> None:
         for i in range(4):
             for j in range(4):
                 v = state["board"][i][j]
+                if v >= 128:
+                    desktop.os.achievements.unlock("2048_128")
+                if v >= 2048:
+                    desktop.os.achievements.unlock("2048_2048")
                 labels[i][j].config(text=str(v) if v else "",
                                     bg=COLORS.get(v, "#3c3a32"),
                                     fg="#776e65" if v < 8 else "white")
@@ -3640,6 +3993,7 @@ def open_2048(desktop, *_) -> None:
 
     def move(direction):
         b = state["board"]
+        before = [row[:] for row in b]
         if direction in ("left", "right"):
             for i in range(4):
                 row = b[i] if direction == "left" else b[i][::-1]
@@ -3655,6 +4009,8 @@ def open_2048(desktop, *_) -> None:
                     col = col[::-1]
                 for i in range(4):
                     b[i][j] = col[i]
+        if b == before:
+            return
         new_tile()
         draw()
 
@@ -3678,6 +4034,7 @@ def open_2048(desktop, *_) -> None:
 
 def open_snake(desktop, *_) -> None:
     w = AppWindow(desktop, "Змейка", "🐍", mem=7)
+    desktop.os.achievements.unlock("welcome")
     canvas = tk.Canvas(w.body, bg="#0b1220", highlightthickness=0)
     canvas.pack(fill="both", expand=True)
     state = {"snake": [(10, 10)], "dir": (1, 0), "food": (15, 15),
@@ -3705,7 +4062,9 @@ def open_snake(desktop, *_) -> None:
             dx, dy = state["dir"]
             x, y = state["snake"][-1]
             nx, ny = x + dx, y + dy
-            if (nx, ny) in state["snake"] or nx < 0 or ny < 0:
+            cols = max(2, canvas.winfo_width() // CELL)
+            rows = max(2, canvas.winfo_height() // CELL)
+            if (nx, ny) in state["snake"] or nx < 0 or ny < 0 or nx >= cols or ny >= rows:
                 state["alive"] = False
                 draw()
                 canvas.create_text(canvas.winfo_width() / 2,
@@ -3716,7 +4075,14 @@ def open_snake(desktop, *_) -> None:
             state["snake"].append((nx, ny))
             if (nx, ny) == state["food"]:
                 state["score"] += 1
-                state["food"] = (random.randint(1, 18), random.randint(1, 18))
+                if state["score"] >= 10:
+                    desktop.os.achievements.unlock("snake_10")
+                if state["score"] >= 50:
+                    desktop.os.achievements.unlock("snake_50")
+                free = [(fx, fy) for fx in range(cols) for fy in range(rows)
+                        if (fx, fy) not in state["snake"]]
+                if free:
+                    state["food"] = random.choice(free)
             else:
                 state["snake"].pop(0)
             draw()
@@ -3727,7 +4093,10 @@ def open_snake(desktop, *_) -> None:
     def key(event):
         m = {"Up": (0, -1), "Down": (0, 1), "Left": (-1, 0), "Right": (1, 0)}
         if event.keysym in m:
-            state["dir"] = m[event.keysym]
+            new_dir = m[event.keysym]
+            old_dir = state["dir"]
+            if len(state["snake"]) == 1 or new_dir != (-old_dir[0], -old_dir[1]):
+                state["dir"] = new_dir
 
     w.bind("<Key>", key)
     w.after(120, lambda: (w.focus_force(), tick()))
@@ -3735,6 +4104,7 @@ def open_snake(desktop, *_) -> None:
 
 def open_tetris(desktop, *_) -> None:
     w = AppWindow(desktop, "Тетрис", "🧱", mem=8)
+    desktop.os.achievements.unlock("welcome")
     canvas = tk.Canvas(w.body, bg="#0b1220", highlightthickness=0)
     canvas.pack(fill="both", expand=True)
     CELL = 22
@@ -3771,6 +4141,12 @@ def open_tetris(desktop, *_) -> None:
         if collision(shape, state["x"], state["y"]):
             state["over"] = True
 
+    def rotate(shape):
+        height, width = len(shape), max(len(row) for row in shape)
+        padded = [row.ljust(width, ".") for row in shape]
+        return ["".join(padded[height - 1 - r][c] for r in range(height))
+                for c in range(width)]
+
     def lock():
         shape = state["cur"]
         for i, row in enumerate(shape):
@@ -3784,6 +4160,9 @@ def open_tetris(desktop, *_) -> None:
                 del state["board"][i]
                 state["board"].insert(0, [0] * COLS)
                 state["score"] += 10
+                desktop.os.achievements.unlock("tetris_line")
+                if state["score"] >= 100:
+                    desktop.os.achievements.unlock("tetris_100")
         new_piece()
 
     def draw():
@@ -3836,6 +4215,10 @@ def open_tetris(desktop, *_) -> None:
         elif event.keysym == "space":
             while not collision(state["cur"], state["x"], state["y"] + 1):
                 state["y"] += 1
+        elif event.keysym == "Up":
+            turned = rotate(state["cur"])
+            if not collision(turned, state["x"], state["y"]):
+                state["cur"] = turned
         draw()
 
     new_piece()
@@ -3845,6 +4228,7 @@ def open_tetris(desktop, *_) -> None:
 
 def open_minesweeper(desktop, *_) -> None:
     w = AppWindow(desktop, "Сапёр", "💣", mem=7)
+    desktop.os.achievements.unlock("welcome")
     size = 9
     bombs = 10
     box = centered(w.body)
@@ -3854,8 +4238,8 @@ def open_minesweeper(desktop, *_) -> None:
     revealed = [[False] * size for _ in range(size)]
     flags = [[False] * size for _ in range(size)]
     btns = [[None] * size for _ in range(size)]
-    for _ in range(bombs):
-        i, j = random.randint(0, size - 1), random.randint(0, size - 1)
+    finished = [False]
+    for i, j in random.sample([(i, j) for i in range(size) for j in range(size)], bombs):
         board[i][j] = -1
     for i in range(size):
         for j in range(size):
@@ -3867,12 +4251,18 @@ def open_minesweeper(desktop, *_) -> None:
             board[i][j] = cnt
 
     def reveal(i, j):
-        if revealed[i][j] or flags[i][j]:
+        if finished[0] or revealed[i][j] or flags[i][j]:
             return
         revealed[i][j] = True
         btns[i][j].config(state="disabled", relief="sunken")
         if board[i][j] == -1:
+            finished[0] = True
+            desktop.os.achievements.unlock("minesweeper_boom")
             btns[i][j].config(text="💣", bg="#ef4444")
+            for bi in range(size):
+                for bj in range(size):
+                    if board[bi][bj] == -1:
+                        btns[bi][bj].config(text="💣", bg="#ef4444")
             return
         if board[i][j] == 0:
             for di in (-1, 0, 1):
@@ -3881,6 +4271,10 @@ def open_minesweeper(desktop, *_) -> None:
                         reveal(i + di, j + dj)
         else:
             btns[i][j].config(text=str(board[i][j]))
+        if sum(revealed[ri][rj] for ri in range(size) for rj in range(size)) == size * size - bombs:
+            finished[0] = True
+            desktop.os.achievements.unlock("minesweeper_win")
+            messagebox.showinfo("Сапёр", "Победа!", parent=w)
 
     def flag(event, i, j):
         if revealed[i][j]:
@@ -3931,30 +4325,170 @@ def open_paint(desktop, *_) -> None:
 
 def open_browser(desktop, *_) -> None:
     w = AppWindow(desktop, "Браузер", "🌐", mem=8)
-    bar = tk.Frame(w.body, bg=BG_WINDOW)
-    bar.pack(fill="x")
-    url = tk.Entry(bar, font=FONT)
-    url.pack(side="left", fill="x", expand=True)
-    url.insert(0, "http://localhost/")
-    text = tk.Text(w.body, font=("Consolas", 11), bd=0)
-    text.pack(fill="both", expand=True, pady=6)
+    toolbar = tk.Frame(w.body, bg=BG_WINDOW)
+    toolbar.pack(fill="x")
+    tabs = ttk.Notebook(w.body)
+    tabs.pack(fill="both", expand=True, pady=(4, 0))
+    tab_states: dict[str, dict] = {}
+    bookmarks: list[str] = []
 
-    def go():
-        u = url.get().strip()
-        if not re.match(r"https?://", u):
-            u = "http://" + u
+    def normalize(value: str) -> str:
+        value = value.strip()
+        if not value:
+            return "http://localhost/"
+        return value if re.match(r"https?://", value) else "http://" + value
+
+    def state_for_tab() -> Optional[dict]:
+        tab_id = tabs.select()
+        return tab_states.get(tab_id)
+
+    def update_nav(state: dict) -> None:
+        if not state:
+            return
+        state["back"].config(state="normal" if state["back_history"] else "disabled")
+        state["forward"].config(state="normal" if state["forward_history"] else "disabled")
+
+    def mark_urls(state: dict) -> None:
+        text = state["text"]
+        text.tag_delete("url")
+        content = text.get("1.0", "end-1c")
+        for match in re.finditer(r"(?:https?://|localhost(?:/|$))[\w.\-/:?=&%#]+", content):
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.end()}c"
+            text.tag_add("url", start, end)
+        text.tag_configure("url", foreground="#2563eb", underline=True)
+        text.tag_bind("url", "<Button-1>",
+                      lambda event, s=state: open_tag_url(s, event))
+
+    def open_tag_url(state: dict, event) -> None:
+        index = state["text"].index(f"@{event.x},{event.y}")
+        value = state["text"].get(
+            state["text"].tag_prevrange("url", index)[0] if state["text"].tag_prevrange("url", index)
+            else index,
+            state["text"].tag_nextrange("url", index)[1]
+            if state["text"].tag_nextrange("url", index) else index)
+        if value:
+            load(state, value.strip(), True)
+
+    def load(state: dict, value: str, add_history: bool = True) -> None:
+        u = normalize(value)
+        if add_history and state["current"] and state["current"] != u:
+            state["back_history"].append(state["current"])
+            state["forward_history"].clear()
+        state["current"] = u
+        state["url"].delete(0, "end")
+        state["url"].insert(0, u)
         try:
-            text.delete("1.0", "end")
-            text.insert("1.0", desktop.os.net.fetch(u))
-            if "/" not in u.split("//", 1)[1] or u.endswith("/"):
-                text.insert("end", "\n\n" + desktop.os.vfs.read("/public/index.html"))
+            host_path = u.split("//", 1)[1]
+            path = "/" + host_path.split("/", 1)[1] if "/" in host_path else "/"
+            response = desktop.os.net.fetch(u)
+            if path == "/":
+                response += "\n\n" + desktop.os.vfs.read("/public/index.html")
+            state["text"].delete("1.0", "end")
+            state["text"].insert("1.0", response)
+            state["status"].config(text=f"Открыто: {u}")
+            mark_urls(state)
         except (PyOSError, VFSError) as e:
-            text.delete("1.0", "end")
-            text.insert("1.0", f"Ошибка: {e}")
+            state["text"].delete("1.0", "end")
+            state["text"].insert("1.0", f"Ошибка: {e}")
+            state["status"].config(text=f"Ошибка: {e}")
+        update_nav(state)
 
-    url.bind("<Return>", lambda e: go())
-    tk.Button(bar, text="→", command=go).pack(side="left", padx=4)
-    go()
+    def go() -> None:
+        state = state_for_tab()
+        if state:
+            load(state, state["url"].get())
+
+    def back() -> None:
+        state = state_for_tab()
+        if state and state["back_history"]:
+            previous = state["back_history"].pop()
+            state["forward_history"].append(state["current"])
+            load(state, previous, False)
+
+    def forward() -> None:
+        state = state_for_tab()
+        if state and state["forward_history"]:
+            following = state["forward_history"].pop()
+            state["back_history"].append(state["current"])
+            load(state, following, False)
+
+    def reload() -> None:
+        state = state_for_tab()
+        if state:
+            load(state, state["current"] or state["url"].get(), False)
+
+    def find_page() -> None:
+        state = state_for_tab()
+        if not state:
+            return
+        query = simpledialog.askstring("Поиск", "Найти на странице:", parent=w)
+        if not query:
+            return
+        state["text"].tag_remove("find", "1.0", "end")
+        pos = "1.0"
+        count = 0
+        while True:
+            pos = state["text"].search(query, pos, "end", nocase=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(query)}c"
+            state["text"].tag_add("find", pos, end)
+            pos = end
+            count += 1
+        state["text"].tag_configure("find", background="#fde68a", foreground="black")
+        state["status"].config(text=f"Найдено совпадений: {count}")
+
+    def bookmark() -> None:
+        state = state_for_tab()
+        if state and state["current"] and state["current"] not in bookmarks:
+            bookmarks.append(state["current"])
+            state["status"].config(text="Добавлено в закладки")
+
+    def show_bookmarks() -> None:
+        if not bookmarks:
+            messagebox.showinfo("Закладки", "Закладок пока нет", parent=w)
+            return
+        choice = simpledialog.askstring("Закладки", "\n".join(
+            f"{i + 1}. {u}" for i, u in enumerate(bookmarks)), parent=w)
+        if choice and choice.isdigit() and 1 <= int(choice) <= len(bookmarks):
+            state = state_for_tab()
+            if state:
+                load(state, bookmarks[int(choice) - 1])
+
+    def new_tab() -> None:
+        frame = tk.Frame(tabs, bg=BG_WINDOW)
+        nav = tk.Frame(frame, bg=BG_WINDOW)
+        nav.pack(fill="x")
+        back_btn = tk.Button(nav, text="←", width=3, command=back, state="disabled")
+        back_btn.pack(side="left", padx=2)
+        forward_btn = tk.Button(nav, text="→", width=3, command=forward, state="disabled")
+        forward_btn.pack(side="left", padx=2)
+        url = tk.Entry(nav, font=FONT)
+        url.pack(side="left", fill="x", expand=True)
+        url.insert(0, "http://localhost/")
+        text = tk.Text(frame, font=("Consolas", 11), bd=0)
+        text.pack(fill="both", expand=True, pady=6)
+        status = tk.Label(frame, text="Готово", bg=BG_WINDOW, anchor="w")
+        status.pack(side="bottom", fill="x")
+        state = {"url": url, "text": text, "status": status, "back": back_btn,
+                 "forward": forward_btn, "back_history": [], "forward_history": [],
+                 "current": ""}
+        tab_id = str(frame)
+        tab_states[tab_id] = state
+        tabs.add(frame, text="Новая вкладка")
+        tabs.select(frame)
+        url.bind("<Return>", lambda e: go())
+        load(state, url.get(), False)
+
+    tk.Button(toolbar, text="＋ Вкладка", command=new_tab).pack(side="left", padx=2)
+    tk.Button(toolbar, text="Открыть", command=go).pack(side="left", padx=2)
+    tk.Button(toolbar, text="⟳", command=reload).pack(side="left", padx=2)
+    tk.Button(toolbar, text="⌕ Поиск", command=find_page).pack(side="left", padx=2)
+    tk.Button(toolbar, text="☆ Закладка", command=bookmark).pack(side="left", padx=2)
+    tk.Button(toolbar, text="Закладки", command=show_bookmarks).pack(side="left", padx=2)
+    tabs.bind("<<NotebookTabChanged>>", lambda e: update_nav(state_for_tab() or {}))
+    new_tab()
 
 
 def open_calendar(desktop, *_) -> None:
@@ -4017,6 +4551,34 @@ def open_media(desktop, *_) -> None:
     draw_bars()
 
 
+def open_achievements(desktop, *_) -> None:
+    w = AppWindow(desktop, "Достижения", "🏆", mem=7)
+    kernel = desktop.os
+    total = len(AchievementManager.DEFINITIONS)
+    opened = len(kernel.achievements.unlocked)
+    tk.Label(w.body, text=f"Достижения PyOS   {opened}/{total}",
+             bg=BG_WINDOW, fg=ACCENT, font=("Segoe UI", 16, "bold")).pack(pady=8)
+    lb = tk.Listbox(w.body, font=("Segoe UI", 11), bd=0,
+                    bg="#111827", fg="#e5e7eb", selectbackground=ACCENT)
+    lb.pack(fill="both", expand=True, padx=8, pady=4)
+    for key, (title, description) in AchievementManager.DEFINITIONS.items():
+        mark = "🏆" if kernel.achievements.is_unlocked(key) else "🔒"
+        lb.insert("end", f"{mark}  {title} — {description}")
+
+
+def open_package_app(desktop, package: str, *_) -> None:
+    app = desktop.os.packages.apps.get(package)
+    if not app:
+        return
+    w = AppWindow(desktop, app.get("title", package), app.get("icon", "📦"), mem=8)
+    tk.Label(w.body, text=app.get("title", package), bg=BG_WINDOW,
+             fg=ACCENT, font=("Segoe UI", 18, "bold")).pack(pady=12)
+    text = tk.Text(w.body, font=("Consolas", 11), bd=0, wrap="word")
+    text.pack(fill="both", expand=True, padx=8, pady=8)
+    text.insert("1.0", app.get("content", ""))
+    text.config(state="disabled")
+
+
 APPS = {
     "terminal": ("Терминал", "🖥", open_terminal),
     "files": ("Файлы", "📁", open_files),
@@ -4042,6 +4604,7 @@ APPS = {
     "tetris": ("Тетрис", "🧱", open_tetris),
     "minesweeper": ("Сапёр", "💣", open_minesweeper),
     "about": ("О системе", "ℹ", open_about),
+    "achievements": ("Достижения", "🏆", open_achievements),
 }
 
 
@@ -4114,8 +4677,26 @@ class Desktop:
         self.root.bind_all("<Super_L>", lambda e: self.toggle_start_menu())
         self.root.bind_all("<Control-Alt-l>", lambda e: self.lock_screen())
         self.root.bind_all("<Control-Alt-d>", lambda e: self.show_desktop())
+        self.root.bind_all("<Button-1>", self._interface_click, add="+")
+
+    def _interface_click(self, event=None) -> None:
+        if not self.os.sound_enabled or self.os.sound_volume <= 0:
+            return
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
 
     def show_desktop(self) -> None:
+        if getattr(self, "_desktop_hidden", False):
+            for win in list(self.windows):
+                try:
+                    win.deiconify()
+                except tk.TclError:
+                    pass
+            self._desktop_hidden = False
+            return
+        self._desktop_hidden = True
         for win in list(self.windows):
             try:
                 win.withdraw()
@@ -4135,6 +4716,10 @@ class Desktop:
                 win.close()
 
     def launch_from_os(self, key: str, *args) -> bool:
+        if key.startswith("pkg:"):
+            package = key[4:]
+            self.root.after(10, lambda: open_package_app(self, package))
+            return package in self.os.packages.apps
         entry = APPS.get(key)
         if not entry:
             return False
@@ -4246,7 +4831,12 @@ class Desktop:
 
     def focus_window(self, win) -> None:
         try:
-            win.deiconify()
+            if str(win.state()) == "withdrawn":
+                win.deiconify()
+            else:
+                win.withdraw()
+                self._desktop_hidden = False
+                return
             win.lift()
             win.focus_force()
         except tk.TclError:
