@@ -1,0 +1,4729 @@
+#!/usr/bin/env python3
+"""
+PyOS 3.0 «Nebula» — виртуальная ОС на Python (GUI + CLI). Исправленная версия.
+
+Запуск:
+    python3 pyos3.py             # GUI, полный экран
+    python3 pyos3.py --window    # GUI, окно 1280x800
+    python3 pyos3.py --cli       # только терминал
+    python3 pyos3.py --nologin   # без экрана входа
+    python3 pyos3.py --noboot    # без экрана загрузки
+    python3 pyos3.py --webserver # + реальный HTTP на 127.0.0.1:8080 (из /public)
+"""
+
+from __future__ import annotations
+
+import ast
+import datetime
+import fnmatch
+import hashlib
+import http.server
+import json
+import operator
+import os
+import random
+import re
+import shlex
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from typing import Any, Callable, Optional
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog, ttk
+except ImportError:
+    tk = None
+    messagebox = simpledialog = None
+
+VERSION = "PyOS 3.0 «Nebula»"
+STATE_VERSION = 3
+NATIVE = "--native" in sys.argv
+
+
+# ============================================================
+#                    ИСКЛЮЧЕНИЯ
+# ============================================================
+class PyOSError(Exception):
+    """Базовое исключение PyOS."""
+
+
+class VFSError(PyOSError):
+    """Ошибка файловой системы."""
+
+
+class PermError(PyOSError):
+    """Ошибка прав доступа."""
+
+
+# ============================================================
+#                    УТИЛИТЫ
+# ============================================================
+_BIN_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod, ast.Pow: operator.pow,
+}
+_UN_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+
+def safe_eval(expr: str):
+    """Безопасно вычисляет арифметическое выражение."""
+    def ev(node, depth=0):
+        if depth > 40:
+            raise ValueError("выражение слишком сложное")
+        if isinstance(node, ast.Expression):
+            return ev(node.body, depth + 1)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            if abs(node.value) > 10**12:
+                raise ValueError("слишком большое число")
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+            left, right = ev(node.left, depth + 1), ev(node.right, depth + 1)
+            if type(node.op) is ast.Pow:
+                if abs(right) > 100 or abs(left) > 10**6:
+                    raise ValueError("слишком большая степень")
+                return left ** right
+            r = _BIN_OPS[type(node.op)](left, right)
+            if isinstance(r, (int, float)) and abs(r) > 10**12:
+                raise ValueError("результат слишком большой")
+            return r
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _UN_OPS:
+            return _UN_OPS[type(node.op)](ev(node.operand, depth + 1))
+        raise ValueError("недопустимое выражение")
+    return ev(ast.parse(expr.strip(), mode="eval"))
+
+
+def fmt_num(x) -> str:
+    """Форматирует число (0.1+0.2 -> 0.3, 4.0 -> 4)."""
+    if isinstance(x, float):
+        if x != x or x in (float("inf"), float("-inf")):
+            return str(x)
+        x = round(x, 10)
+        if x.is_integer():
+            return str(int(x))
+    return str(x)
+
+
+def now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n}{unit}"
+        n //= 1024
+    return f"{n}T"
+
+
+def parse_mode(text: str) -> int:
+    """Парсит '755' или 'rwxr-xr-x' в число 0..0o777."""
+    text = text.strip()
+    if re.fullmatch(r"[0-7]{3,4}", text):
+        return int(text, 8) & 0o777
+    if len(text) == 9:
+        mode = 0
+        for i, ch in enumerate(text):
+            if ch != "-":
+                mode |= 1 << (8 - i)
+        return mode
+    raise ValueError("неверный формат прав")
+
+
+def mode_str(mode: int) -> str:
+    """Возвращает 'rwxr-xr-x'."""
+    chars = []
+    for shift in (6, 3, 0):
+        bits = (mode >> shift) & 0b111
+        chars.append("r" if bits & 4 else "-")
+        chars.append("w" if bits & 2 else "-")
+        chars.append("x" if bits & 1 else "-")
+    return "".join(chars)
+
+
+# ============================================================
+#                    ЛОГГЕР
+# ============================================================
+class Logger:
+    """Логирование в /var/log/pyos.log и в stderr при DEBUG."""
+
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
+
+    def __init__(self, vfs: "VFS", path: str = "/var/log/pyos.log") -> None:
+        self.vfs = vfs
+        self.path = path
+        self.level = "INFO"
+        self._lock = threading.Lock()
+        self._ensure_file()
+
+    def _ensure_file(self) -> None:
+        try:
+            if not self.vfs.exists(self.path):
+                self.vfs.mkdir_p("/var/log")
+                self.vfs.write(self.path, "", system=True)
+        except Exception:
+            pass
+
+    def log(self, level: str, msg: str) -> None:
+        if self.LEVELS.get(level, 0) < self.LEVELS.get(self.level, 20):
+            return
+        line = f"{now_iso()} [{level}] {msg}\n"
+        with self._lock:
+            try:
+                cur = self.vfs.read(self.path) if self.vfs.exists(self.path) else ""
+                self.vfs.write(self.path, cur + line, system=True)
+            except Exception:
+                pass
+        if self.level == "DEBUG":
+            sys.stderr.write(line)
+
+    def debug(self, msg: str) -> None: self.log("DEBUG", msg)
+    def info(self, msg: str) -> None: self.log("INFO", msg)
+    def warning(self, msg: str) -> None: self.log("WARNING", msg)
+    def error(self, msg: str) -> None: self.log("ERROR", msg)
+
+
+# ============================================================
+#                    ШИНА СОБЫТИЙ
+# ============================================================
+class EventBus:
+    """Простая синхронная шина событий."""
+
+    def __init__(self) -> None:
+        self._subs: dict[str, list[Callable]] = {}
+        self._lock = threading.Lock()
+
+    def on(self, event: str, handler: Callable) -> None:
+        with self._lock:
+            self._subs.setdefault(event, []).append(handler)
+
+    def off(self, event: str, handler: Callable) -> None:
+        with self._lock:
+            if event in self._subs and handler in self._subs[event]:
+                self._subs[event].remove(handler)
+
+    def emit(self, event: str, **kwargs) -> None:
+        with self._lock:
+            handlers = list(self._subs.get(event, ()))
+        for h in handlers:
+            try:
+                h(**kwargs)
+            except Exception as e:
+                sys.stderr.write(f"event {event}: {e}\n")
+
+
+# ============================================================
+#                    ВИРТУАЛЬНАЯ ФС 3.0
+# ============================================================
+class FileNode:
+    """Узел ФС: файл, директория или симлинк с метаданными."""
+
+    def __init__(self, kind: str = "file", content: str = "",
+                 owner: str = "user", group: str = "user",
+                 mode: int = 0o644, link_target: Optional[str] = None,
+                 hidden: bool = False, readonly: bool = False,
+                 executable: bool = False) -> None:
+        self.kind = kind
+        self.content = content
+        self.children: dict[str, "FileNode"] = {}
+        self.owner = owner
+        self.group = group
+        self.mode = mode
+        self.ctime = self.mtime = time.time()
+        self.hidden = hidden
+        self.readonly = readonly
+        self.executable = executable
+        self.link_target = link_target
+
+    def to_json(self) -> dict:
+        d = {
+            "kind": self.kind, "content": self.content,
+            "owner": self.owner, "group": self.group, "mode": self.mode,
+            "ctime": self.ctime, "mtime": self.mtime,
+            "hidden": self.hidden, "readonly": self.readonly,
+            "executable": self.executable, "link_target": self.link_target,
+        }
+        if self.kind == "dir":
+            d["children"] = {k: v.to_json() for k, v in self.children.items()}
+        return d
+
+    @classmethod
+    def from_json(cls, d: dict) -> "FileNode":
+        node = cls(kind=d.get("kind", "file"),
+                   content=d.get("content", ""),
+                   owner=d.get("owner", "user"),
+                   group=d.get("group", "user"),
+                   mode=d.get("mode", 0o644),
+                   link_target=d.get("link_target"),
+                   hidden=d.get("hidden", False),
+                   readonly=d.get("readonly", False),
+                   executable=d.get("executable", False))
+        node.ctime = d.get("ctime", time.time())
+        node.mtime = d.get("mtime", time.time())
+        for k, v in d.get("children", {}).items():
+            node.children[k] = cls.from_json(v)
+        return node
+
+
+class VFS:
+    """Виртуальная ФС в памяти: метаданные, права, симлинки, корзина."""
+
+    PROTECTED = ("/etc", "/bin", "/usr", "/var", "/mnt")
+
+    MAX_LINK_HOPS = 40
+
+    def __init__(self) -> None:
+        self.root = FileNode(kind="dir", owner="root", group="root", mode=0o755)
+        self.cwd: list[str] = ["home", "user"]
+        # Хуки, устанавливаются Kernel'ом после сборки всех подсистем
+        self._perm_checker: Optional[Callable[[FileNode, str], bool]] = None
+        self._current_user_fn: Callable[[], str] = lambda: "user"
+        self._init_tree()
+
+    def set_perm_checker(self, checker: Callable[[FileNode, str], bool]) -> None:
+        self._perm_checker = checker
+
+    def set_current_user_provider(self, fn: Callable[[], str]) -> None:
+        self._current_user_fn = fn
+
+    def _init_tree(self) -> None:
+        def add(path: str, node: FileNode) -> None:
+            parts = [p for p in path.split("/") if p]
+            cur = self.root
+            for p in parts[:-1]:
+                cur = cur.children.setdefault(p, FileNode(kind="dir", owner="root",
+                                                          group="root", mode=0o755))
+            cur.children[parts[-1]] = node
+
+        add("/home/guest", FileNode(kind="dir", owner="guest", group="guest", mode=0o755))
+        add("/home/user", FileNode(kind="dir", owner="user", group="user", mode=0o755))
+        add("/home/user/readme.txt",
+            FileNode(content="Добро пожаловать в PyOS 3.0!\nВведите help.\n", owner="user"))
+        add("/home/user/notes.txt",
+            FileNode(content="Мои заметки:\n- изучить Python\n", owner="user"))
+        add("/home/user/.trash", FileNode(kind="dir", owner="user", mode=0o755))
+        add("/home/user/.config", FileNode(kind="dir", owner="user", mode=0o755))
+        add("/root", FileNode(kind="dir", owner="root", group="root", mode=0o700))
+        add("/etc/motd", FileNode(content=f"{VERSION} — приятной работы!\n",
+                                  owner="root", mode=0o644))
+        add("/etc/rc.local", FileNode(content="# автозапуск\n", owner="root"))
+        add("/etc/passwd", FileNode(
+            content="guest:x:0:0::/home/guest\nuser:x:1000:1000::/home/user\nroot:x:0:0::/root\n",
+            owner="root"))
+        add("/usr/bin", FileNode(kind="dir", owner="root"))
+        add("/var/log", FileNode(kind="dir", owner="root"))
+        add("/mnt", FileNode(kind="dir", owner="root"))
+        add("/public/index.html", FileNode(
+            content="<h1>PyOS Public</h1><p>Виртуальный веб-сервер.</p>", owner="root"))
+        add("/bin", FileNode(kind="dir", owner="root"))
+        add("/tmp", FileNode(kind="dir", owner="root", mode=0o777))
+
+    # ---------- экспорт/импорт ----------
+    def export_state(self) -> dict:
+        return {"root": self.root.to_json(), "cwd": list(self.cwd)}
+
+    def import_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        root = state.get("root")
+        if not isinstance(root, dict):
+            return
+        try:
+            self.root = FileNode.from_json(root)
+            cwd = state.get("cwd", ["home", "user"])
+            if isinstance(cwd, list) and all(isinstance(p, str) for p in cwd):
+                self.cwd = cwd
+        except Exception:
+            pass
+
+    # ---------- пути ----------
+    def resolve(self, path: Optional[str]) -> list[str]:
+        if not path:
+            return list(self.cwd)
+        raw = [p for p in path.split("/") if p]
+        parts = raw if path.startswith("/") else self.cwd + raw
+        out: list[str] = []
+        for p in parts:
+            if p == ".":
+                continue
+            if p == "..":
+                if out:
+                    out.pop()
+                continue
+            out.append(p)
+        return out
+
+    def _get(self, parts: list[str]) -> Optional[FileNode]:
+        """Возвращает узел с разрешением симлинков (с ограничением глубины)."""
+        node = self.root
+        hops = 0
+        for p in parts:
+            if node.kind != "dir" or p not in node.children:
+                return None
+            node = node.children[p]
+            while node.kind == "link":
+                hops += 1
+                if hops > self.MAX_LINK_HOPS or not node.link_target:
+                    return node  # битая ссылка или цикл — возвращаем как есть
+                target = node.link_target
+                if target.startswith("/"):
+                    new_parts = [x for x in target.split("/") if x]
+                else:
+                    # относительные резолвим от cwd (упрощение)
+                    new_parts = self.resolve(target)
+                node = self.root
+                broken = False
+                for np in new_parts:
+                    if node.kind != "dir" or np not in node.children:
+                        broken = True
+                        break
+                    node = node.children[np]
+                if broken:
+                    return None
+        return node
+
+    def _split(self, path: str):
+        parts = self.resolve(path)
+        if not parts:
+            raise VFSError("некорректный путь")
+        parent = self._get(parts[:-1])
+        if parent is None or parent.kind != "dir":
+            raise VFSError(f"нет такой директории: {'/'.join(parts[:-1]) or '/'}")
+        return parent, parts[-1]
+
+    def path_str(self) -> str:
+        return "/" + "/".join(self.cwd) if self.cwd else "/"
+
+    # ---------- проверка прав ----------
+    def _check_perm(self, node: FileNode, mode: str) -> bool:
+        if self._perm_checker is None:
+            return True
+        return self._perm_checker(node, mode)
+
+    # ---------- операции ----------
+    def exists(self, path: str) -> bool:
+        return self._get(self.resolve(path)) is not None
+
+    def ls(self, path: Optional[str] = None, show_hidden: bool = False) -> list[FileNode]:
+        parts = self.resolve(path)
+        node = self._get(parts)
+        if node is None:
+            raise VFSError(f"нет такого пути: /{'/'.join(parts)}")
+        if node.kind != "dir":
+            return [node]
+        out = []
+        for name in sorted(node.children):
+            n = node.children[name]
+            if n.hidden and not show_hidden:
+                continue
+            out.append(n)
+        return out
+
+    def names(self, path: Optional[str] = None, show_hidden: bool = False) -> list[str]:
+        parts = self.resolve(path)
+        node = self._get(parts)
+        if node is None:
+            raise VFSError("нет такого пути")
+        if node.kind != "dir":
+            return [parts[-1]]
+        return [n + ("/" if node.children[n].kind == "dir" else
+                     ("@" if node.children[n].kind == "link" else ""))
+                for n in sorted(node.children)
+                if show_hidden or not node.children[n].hidden]
+
+    def cd(self, path: Optional[str]) -> None:
+        parts = self.resolve(path or "/home/user")
+        node = self._get(parts)
+        if node is None or node.kind != "dir":
+            raise VFSError(f"нет такой директории: {path}")
+        self.cwd = parts
+
+    def mkdir(self, path: str) -> None:
+        parent, name = self._split(path)
+        if name in parent.children:
+            raise VFSError(f"уже существует: {path}")
+        if not self._check_perm(parent, "w"):
+            raise PermError(f"нет прав на создание в {path}")
+        parent.children[name] = FileNode(kind="dir", owner=self._current_user_fn())
+        parent.mtime = time.time()
+
+    def mkdir_p(self, path: str) -> None:
+        parts = self.resolve(path)
+        cur = self.root
+        for p in parts:
+            if p not in cur.children:
+                cur.children[p] = FileNode(kind="dir", owner=self._current_user_fn())
+            cur = cur.children[p]
+            if cur.kind != "dir":
+                raise VFSError(f"не директория: {p}")
+
+    def touch(self, path: str) -> None:
+        parent, name = self._split(path)
+        if name not in parent.children:
+            if not self._check_perm(parent, "w"):
+                raise PermError(f"нет прав на создание: {path}")
+            parent.children[name] = FileNode(owner=self._current_user_fn())
+        parent.children[name].mtime = time.time()
+
+    def read(self, path: str) -> str:
+        node = self._get(self.resolve(path))
+        if node is None:
+            raise VFSError(f"нет такого файла: {path}")
+        if node.kind == "dir":
+            raise VFSError(f"это директория: {path}")
+        if not self._check_perm(node, "r"):
+            raise PermError(f"нет прав на чтение: {path}")
+        return node.content
+
+    def write(self, path: str, content: str, system: bool = False) -> None:
+        parts = self.resolve(path)
+        parent, name = self._split(path)
+        node = parent.children.get(name)
+        if node and node.kind == "dir":
+            raise VFSError(f"это директория: {path}")
+        if not system:
+            if node is not None:
+                if not self._check_perm(node, "w"):
+                    raise PermError(f"нет прав на запись: {path}")
+            else:
+                if not self._check_perm(parent, "w"):
+                    raise PermError(f"нет прав на создание: {path}")
+        if node is None:
+            node = FileNode(owner=self._current_user_fn())
+            parent.children[name] = node
+        if node.readonly and not system:
+            raise PermError(f"файл только для чтения: {path}")
+        node.content = content
+        node.mtime = time.time()
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.write(path, data.decode("latin-1"))
+
+    def read_bytes(self, path: str) -> bytes:
+        return self.read(path).encode("latin-1")
+
+    def rm(self, path: str, recursive: bool = False, trash: bool = True) -> None:
+        parts = self.resolve(path)
+        if not parts:
+            raise PermError("нельзя удалить корень")
+        parent, name = self._split(path)
+        node = parent.children.get(name)
+        if node is None:
+            raise VFSError(f"нет такого пути: {path}")
+        if not self._check_perm(parent, "w"):
+            raise PermError(f"нет прав на удаление: {path}")
+        if node.kind == "dir" and node.children and not recursive:
+            raise VFSError(f"директория не пуста: {path}")
+        if trash and not any(p == ".trash" for p in parts):
+            trash_dir = self._get(["home", "user", ".trash"])
+            if trash_dir and trash_dir.kind == "dir":
+                stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                base = f"{stamp}_{name}"
+                final = base
+                n = 1
+                while final in trash_dir.children:
+                    final = f"{base}.{n}"
+                    n += 1
+                trash_dir.children[final] = node
+                del parent.children[name]
+                parent.mtime = time.time()
+                return
+        del parent.children[name]
+        parent.mtime = time.time()
+
+    # ---------- поиск ----------
+    def walk(self, path: Optional[str] = None):
+        parts = self.resolve(path)
+        node = self._get(parts)
+        if node is None:
+            return
+        visited: set[int] = set()
+        stack: list[tuple[list[str], FileNode]] = [(list(parts), node)]
+        while stack:
+            cur_parts, cur_node = stack.pop()
+            nid = id(cur_node)
+            if nid in visited:
+                continue
+            visited.add(nid)
+            yield cur_parts, cur_node
+            if cur_node.kind == "dir":
+                for name in sorted(cur_node.children):
+                    stack.append((cur_parts + [name], cur_node.children[name]))
+
+    def find(self, base: str, pattern: str) -> list[str]:
+        out = []
+        for parts, node in self.walk(base):
+            if parts and fnmatch.fnmatch(parts[-1], pattern):
+                out.append("/" + "/".join(parts))
+        return out
+
+    def trash_list(self) -> list[str]:
+        t = self._get(["home", "user", ".trash"])
+        if t is None:
+            return []
+        return sorted(t.children)
+
+    def trash_restore(self, name: str) -> None:
+        t = self._get(["home", "user", ".trash"])
+        if t is None or name not in t.children:
+            raise VFSError("нет такого элемента корзины")
+        # имя формата <stamp>_<original> или <stamp>_<original>.<n>
+        if "_" not in name:
+            raise VFSError("неверный формат имени в корзине")
+        target_name = name.split("_", 1)[1]
+        # отрезаем суффикс .N, если он был добавлен из-за коллизии
+        if "." in target_name:
+            head, sep, tail = target_name.rpartition(".")
+            if tail.isdigit():
+                target_name = head
+        home = self._get(["home", "user"])
+        if home is None:
+            raise VFSError("нет /home/user")
+        final = target_name
+        n = 1
+        while final in home.children:
+            final = f"{target_name}.{n}"
+            n += 1
+        home.children[final] = t.children.pop(name)
+
+    def trash_empty(self) -> int:
+        t = self._get(["home", "user", ".trash"])
+        if t is None:
+            return 0
+        n = len(t.children)
+        t.children.clear()
+        return n
+
+    def is_protected(self, path: str) -> bool:
+        parts = self.resolve(path)
+        if len(parts) <= 1:
+            return True
+        s = "/" + "/".join(parts)
+        return any(s == p or s.startswith(p + "/") for p in self.PROTECTED)
+
+    def tree_lines(self, path: Optional[str] = None) -> list[str]:
+        parts = self.resolve(path)
+        node = self._get(parts)
+        if node is None:
+            raise VFSError("нет такого пути")
+        lines = ["/" + "/".join(parts)]
+        if node.kind == "dir":
+            self._walk_tree(node, "", lines)
+        return lines
+
+    def _walk_tree(self, node: FileNode, prefix: str, lines: list[str],
+                   visited: Optional[set[int]] = None) -> None:
+        if visited is None:
+            visited = set()
+        if id(node) in visited:
+            return
+        visited.add(id(node))
+        names = sorted(node.children)
+        for i, name in enumerate(names):
+            last = i == len(names) - 1
+            val = node.children[name]
+            suffix = "/" if val.kind == "dir" else ("@" if val.kind == "link" else "")
+            lines.append(prefix + ("└── " if last else "├── ") + name + suffix)
+            if val.kind == "dir":
+                self._walk_tree(val, prefix + ("    " if last else "│   "),
+                                lines, visited)
+
+    def df(self) -> dict:
+        files = dirs = bytes_total = 0
+        for _, n in self.walk("/"):
+            if n.kind == "dir":
+                dirs += 1
+            else:
+                files += 1
+                bytes_total += len(n.content)
+        return {"files": files, "dirs": dirs, "bytes": bytes_total}
+
+
+# ============================================================
+#                    ПОЛЬЗОВАТЕЛИ 3.0
+# ============================================================
+class User:
+    def __init__(self, name: str, password_hash: Optional[str] = None,
+                 role: str = "user", groups: Optional[list[str]] = None,
+                 home: str = "/home/user") -> None:
+        self.name = name
+        self.password_hash = password_hash
+        self.role = role
+        self.groups = groups or [name]
+        self.home = home
+
+
+class UserManager:
+    """Пользователи, группы, sudo, права по user/group/other."""
+
+    def __init__(self, logger: Logger) -> None:
+        self.logger = logger
+        self.users: dict[str, User] = {
+            "guest": User("guest", None, "guest", ["guest"], "/home/guest"),
+            "user": User("user", self._h("1234"), "user", ["user", "users"], "/home/user"),
+            "root": User("root", self._h("toor"), "admin", ["root", "wheel"], "/root"),
+        }
+        self.groups: dict[str, list[str]] = {
+            "root": ["root"], "wheel": ["root"], "users": ["user"],
+            "user": ["user"], "guest": ["guest"],
+        }
+        self.current = "guest"
+
+    @staticmethod
+    def _h(s: str) -> str:
+        return hashlib.sha256(s.encode()).hexdigest()
+
+    def role(self) -> str:
+        return self.users[self.current].role
+
+    def is_admin(self) -> bool:
+        return self.role() == "admin"
+
+    def login(self, name: str, password: str = ""):
+        u = self.users.get(name)
+        if u is None:
+            return False, "нет такого пользователя"
+        if u.password_hash is None or self._h(password) == u.password_hash:
+            self.current = name
+            self.logger.info(f"login: {name}")
+            return True, f"вошли как {name}"
+        return False, "неверный пароль"
+
+    def whoami(self) -> str:
+        return self.current
+
+    def prompt(self) -> str:
+        return f"{self.current}@pyos{'#' if self.is_admin() else '$'}"
+
+    def add_group(self, group: str) -> None:
+        self.groups.setdefault(group, [])
+
+    def add_user_to_group(self, user: str, group: str) -> None:
+        self.groups.setdefault(group, [])
+        if user not in self.groups[group]:
+            self.groups[group].append(user)
+        if user in self.users and group not in self.users[user].groups:
+            self.users[user].groups.append(group)
+
+    def user_groups(self, user: str) -> list[str]:
+        return list(self.users[user].groups) if user in self.users else []
+
+    def set_password(self, user: str, pwd: str) -> None:
+        if user not in self.users:
+            raise PyOSError("нет такого пользователя")
+        self.users[user].password_hash = self._h(pwd)
+
+    def check_perm(self, node: FileNode, need: str) -> bool:
+        """need: 'r'|'w'|'x'. root всегда может."""
+        if self.current == "root":
+            return True
+        need_bit = {"r": 4, "w": 2, "x": 1}[need]
+        if node.owner == self.current:
+            return bool((node.mode >> 6) & need_bit)
+        if node.group in self.user_groups(self.current):
+            return bool((node.mode >> 3) & need_bit)
+        return bool(node.mode & need_bit)
+
+
+# ============================================================
+#                    ПРОЦЕССЫ 3.0
+# ============================================================
+class Process:
+    def __init__(self, pid: int, name: str, mem: int, user: str,
+                 parent: int = 0, nice: int = 0) -> None:
+        self.pid = pid
+        self.name = name
+        self.mem = mem
+        self.user = user
+        self.parent = parent
+        self.nice = nice
+        self.state = "running"
+        self.cpu = random.uniform(0, 3)
+        self.started = time.time()
+        self.open_files: list[str] = []
+
+
+class ProcessManager:
+    """Процессы с приоритетами, состояниями, сигналами, деревом."""
+
+    def __init__(self, bus: EventBus, logger: Logger) -> None:
+        self.bus = bus
+        self.logger = logger
+        self.procs: list[Process] = [
+            Process(1, "init", 4, "root", parent=0),
+            Process(42, "pyos-gui", 88, "root", parent=1),
+            Process(100, "shell", 12, "user", parent=1),
+        ]
+        self._next = 200
+        self.on_kill: Optional[Callable[[int], None]] = None
+
+    def spawn(self, name: str, mem: int = 10, user: str = "user",
+              parent: int = 1, nice: int = 0) -> int:
+        p = Process(self._next, name, mem, user, parent, nice)
+        self._next += 1
+        self.procs.append(p)
+        self.bus.emit("on_proc_spawn", pid=p.pid, name=name)
+        return p.pid
+
+    def find(self, pid: int) -> Optional[Process]:
+        for p in self.procs:
+            if p.pid == pid:
+                return p
+        return None
+
+    def kill(self, pid: int, sig: str = "TERM"):
+        p = self.find(pid)
+        if p is None:
+            return False, f"нет процесса с pid={pid}"
+        if pid == 1:
+            return False, "нельзя убить init"
+        if sig == "STOP":
+            p.state = "sleeping"
+            return True, f"процесс {pid} остановлен"
+        if sig == "CONT":
+            p.state = "running"
+            return True, f"процесс {pid} продолжен"
+        self.procs.remove(p)
+        self.bus.emit("on_proc_kill", pid=pid)
+        if self.on_kill:
+            try:
+                self.on_kill(pid)
+            except Exception:
+                self.on_kill = None
+        return True, f"процесс {pid} завершён ({sig})"
+
+    def renice(self, pid: int, nice: int) -> None:
+        p = self.find(pid)
+        if p is None:
+            raise PyOSError("нет такого процесса")
+        p.nice = max(-20, min(19, nice))
+
+    def pstree(self) -> list[str]:
+        by_parent: dict[int, list[Process]] = {}
+        for p in self.procs:
+            by_parent.setdefault(p.parent, []).append(p)
+        lines = []
+
+        def rec(pid: int, prefix: str) -> None:
+            p = self.find(pid)
+            if p is None:
+                return
+            lines.append(prefix + f"{p.name}({p.pid})")
+            kids = by_parent.get(pid, [])
+            for i, k in enumerate(kids):
+                last = i == len(kids) - 1
+                rec(k.pid, prefix + ("└─ " if last else "├─ "))
+
+        rec(1, "")
+        return lines
+
+    def total_mem(self) -> int:
+        return sum(p.mem for p in self.procs)
+
+
+# ============================================================
+#                    ПЛАНИРОВЩИК
+# ============================================================
+class ScheduledJob:
+    def __init__(self, jid: int, kind: str, spec: str, command: str) -> None:
+        self.id = jid
+        self.kind = kind
+        self.spec = spec
+        self.command = command
+        self.timer: Optional[threading.Timer] = None
+        self.last_run: Optional[float] = None
+        self.runs = 0
+
+
+class Scheduler:
+    """Планировщик задач: cron, at, bg."""
+
+    def __init__(self, kernel: "Kernel") -> None:
+        self.kernel = kernel
+        self.jobs: dict[int, ScheduledJob] = {}
+        self._next = 1
+        self._lock = threading.Lock()
+        self._stop = False
+        self._cron_timer: Optional[threading.Timer] = None
+
+    @staticmethod
+    def _cron_match(field: str, value: int) -> bool:
+        if field == "*":
+            return True
+        for part in field.split(","):
+            if part.startswith("*/"):
+                try:
+                    step = int(part[2:])
+                except ValueError:
+                    continue
+                if step > 0 and value % step == 0:
+                    return True
+            elif "-" in part:
+                a, b = part.split("-", 1)
+                try:
+                    if int(a) <= value <= int(b):
+                        return True
+                except ValueError:
+                    continue
+            elif part.isdigit() and int(part) == value:
+                return True
+        return False
+
+    def _cron_tick(self) -> None:
+        if self._stop:
+            return
+        now = datetime.datetime.now()
+        with self._lock:
+            jobs = list(self.jobs.values())
+        for j in jobs:
+            if j.kind != "cron":
+                continue
+            try:
+                m, h, d, mo, wd = j.spec.split()
+            except ValueError:
+                continue
+            matched = (
+                self._cron_match(m, now.minute)
+                and self._cron_match(h, now.hour)
+                and self._cron_match(d, now.day)
+                and self._cron_match(mo, now.month)
+                and (wd == "*" or self._cron_match(wd, now.weekday() + 1))
+            )
+            if matched and (j.last_run is None or time.time() - j.last_run > 55):
+                j.last_run = time.time()
+                j.runs += 1
+                threading.Thread(target=self._run_job, args=(j,), daemon=True).start()
+        if self._stop:
+            return
+        t = threading.Timer(20, self._cron_tick)
+        t.daemon = True
+        self._cron_timer = t
+        t.start()
+
+    def _run_job(self, job: ScheduledJob) -> None:
+        try:
+            self.kernel.shell.execute_silent(job.command)
+        except Exception as e:
+            self.kernel.logger.error(f"job {job.id}: {e}")
+
+    def start(self) -> None:
+        self._cron_tick()
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._cron_timer:
+            self._cron_timer.cancel()
+        with self._lock:
+            for j in self.jobs.values():
+                if j.timer:
+                    j.timer.cancel()
+
+    def add_cron(self, spec: str, command: str) -> int:
+        if len(spec.split()) != 5:
+            raise PyOSError("cron: нужно 5 полей 'M H D Mo W'")
+        jid = self._next
+        self._next += 1
+        job = ScheduledJob(jid, "cron", spec, command)
+        self.jobs[jid] = job
+        return jid
+
+    def add_at(self, at_spec: str, command: str) -> int:
+        delay = None
+        if at_spec.startswith("+"):
+            try:
+                delay = int(at_spec[1:])
+            except ValueError:
+                raise PyOSError("at: '+сек' требует число") from None
+        else:
+            try:
+                hh, mm = at_spec.split(":")
+                now = datetime.datetime.now()
+                target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+                if target <= now:
+                    target += datetime.timedelta(days=1)
+                delay = (target - now).total_seconds()
+            except Exception:
+                raise PyOSError("at: ожидаю HH:MM или +секунды") from None
+        jid = self._next
+        self._next += 1
+        job = ScheduledJob(jid, "at", at_spec, command)
+        t = threading.Timer(delay, self._run_job, args=(job,))
+        t.daemon = True
+        job.timer = t
+        self.jobs[jid] = job
+        t.start()
+        return jid
+
+    def add_bg(self, command: str) -> int:
+        jid = self._next
+        self._next += 1
+        job = ScheduledJob(jid, "bg", "now", command)
+        self.jobs[jid] = job
+
+        def run():
+            job.last_run = time.time()
+            job.runs += 1
+            self._run_job(job)
+
+        threading.Thread(target=run, daemon=True).start()
+        return jid
+
+    def remove(self, jid: int) -> bool:
+        j = self.jobs.pop(jid, None)
+        if j and j.timer:
+            j.timer.cancel()
+        return j is not None
+
+    def list_jobs(self) -> list[ScheduledJob]:
+        return sorted(self.jobs.values(), key=lambda j: j.id)
+
+
+# ============================================================
+#                    СЕТЬ
+# ============================================================
+class NetManager:
+    """Виртуальная сеть: хосты, DNS, сокеты-очереди, fetch."""
+
+    def __init__(self) -> None:
+        self.hosts: dict[str, str] = {"localhost": "127.0.0.1"}
+        self._next_ip = 1
+        self._listeners: dict[int, list[str]] = {}
+        self._lock = threading.Lock()
+
+    def add_host(self, name: str) -> str:
+        if name in self.hosts:
+            return self.hosts[name]
+        ip = f"10.0.0.{self._next_ip}"
+        self._next_ip += 1
+        self.hosts[name] = ip
+        return ip
+
+    def resolve(self, name: str) -> Optional[str]:
+        return self.hosts.get(name)
+
+    def ping(self, name: str) -> list[str]:
+        ip = self.resolve(name)
+        if ip is None:
+            raise PyOSError(f"неизвестный хост: {name}")
+        lines = [f"PING {name} ({ip}) 56(84) bytes of data."]
+        for i in range(4):
+            t = random.uniform(2, 25)
+            lines.append(f"64 bytes from {ip}: icmp_seq={i+1} ttl=64 time={t:.1f} ms")
+        lines.append(f"--- {name} ping statistics ---")
+        lines.append("4 packets transmitted, 4 received, 0% packet loss")
+        return lines
+
+    def listen(self, port: int) -> None:
+        with self._lock:
+            self._listeners.setdefault(port, [])
+
+    def send(self, host: str, port: int, msg: str) -> None:
+        if self.resolve(host) is None:
+            raise PyOSError(f"неизвестный хост: {host}")
+        with self._lock:
+            self._listeners.setdefault(port, []).append(msg)
+
+    def recv(self, port: int) -> list[str]:
+        with self._lock:
+            msgs = list(self._listeners.get(port, []))
+            self._listeners[port] = []
+        return msgs
+
+    def fetch(self, url: str) -> str:
+        if not re.match(r"https?://", url):
+            url = "http://" + url
+        m = re.match(r"https?://([^/]+)(/.*)?$", url)
+        if not m:
+            raise PyOSError("неверный URL")
+        host, path = m.group(1), m.group(2) or "/"
+        if host not in self.hosts and host not in ("localhost", "pyos.local"):
+            raise PyOSError(f"не удалось разрешить хост: {host}")
+        return f"HTTP/1.1 200 OK\r\nHost: {host}\r\n\r\n<виртуальная страница {path}>"
+
+
+# ============================================================
+#                    ПАКЕТЫ
+# ============================================================
+class PackageManager:
+    """Виртуальный менеджер пакетов: установка регистрирует команды."""
+
+    REGISTRY: dict[str, dict] = {
+        "hello": {"desc": "Команда hello", "size": 4, "provides": ["hello"]},
+        "sysmon": {"desc": "Мини-монитор системы", "size": 12, "provides": ["sysmon"]},
+        "calc-plus": {"desc": "Расширенный калькулятор", "size": 8, "provides": ["calcplus"]},
+        "fortune": {"desc": "Случайные цитаты", "size": 3, "provides": ["fortune"]},
+        "figlet": {"desc": "ASCII-арт из текста", "size": 6, "provides": ["figlet"]},
+    }
+
+    def __init__(self, kernel: "Kernel") -> None:
+        self.kernel = kernel
+        self.installed: set[str] = set()
+
+    def list_installed(self) -> list[str]:
+        return sorted(self.installed)
+
+    def search(self, query: str) -> list[tuple[str, str]]:
+        q = query.lower()
+        return [(n, d["desc"]) for n, d in self.REGISTRY.items()
+                if q in n or q in d["desc"].lower()]
+
+    def install(self, name: str) -> None:
+        if name not in self.REGISTRY:
+            raise PyOSError(f"пакет не найден: {name}")
+        if name in self.installed:
+            raise PyOSError(f"уже установлен: {name}")
+        self.kernel.vfs.mkdir_p(f"/usr/pkg/{name}")
+        self.kernel.vfs.write(f"/usr/pkg/{name}/README",
+                              self.REGISTRY[name]["desc"] + "\n", system=True)
+        self.installed.add(name)
+        self.kernel.bus.emit("pkg_installed", name=name)
+
+    def remove(self, name: str) -> None:
+        if name not in self.installed:
+            raise PyOSError(f"не установлен: {name}")
+        self.installed.discard(name)
+        try:
+            self.kernel.vfs.rm(f"/usr/pkg/{name}", recursive=True, trash=False)
+        except VFSError:
+            pass
+
+
+# ============================================================
+#                    ЯДРО
+# ============================================================
+class Kernel:
+    """Ядро PyOS: собирает подсистемы, хранит состояние."""
+
+    STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pyos3_state.json")
+    LEGACY_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pyos_state.json")
+
+    def __init__(self) -> None:
+        self.bus = EventBus()
+        self.vfs = VFS()
+        self.logger = Logger(self.vfs)
+        self.users = UserManager(self.logger)
+        self.procs = ProcessManager(self.bus, self.logger)
+        self.net = NetManager()
+        self.scheduler = Scheduler(self)
+        self.packages = PackageManager(self)
+        self.shell = Shell(self)
+        # связываем VFS с правами и текущим пользователем
+        self.vfs.set_perm_checker(self.users.check_perm)
+        self.vfs.set_current_user_provider(lambda: self.users.current)
+        self.theme = "dark"
+        self.wallpaper = "nebula"
+        self.icon_positions: dict[str, list[int]] = {}
+        self.icon_size = 96
+        self.icon_scale = 1.0
+        self.autosave_enabled = True
+        self.show_tooltips = True
+        self.aliases: dict[str, str] = {}
+        self.env_vars: dict[str, str] = {}
+        self.started = time.time()
+        self._stop = False
+        self.launcher: Optional[Callable[..., bool]] = None
+        self.desktop_notify: Optional[Callable[[str, str], None]] = None
+        self._load_state()
+        self.scheduler.start()
+        self.bus.on("on_boot", lambda **_: self.logger.info("boot complete"))
+
+    # ---------- состояние ----------
+    def _load_state(self) -> None:
+        try:
+            with open(self.STATE_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+            if state.get("state_version") == STATE_VERSION:
+                self.vfs.import_state(state.get("vfs", {}))
+                self.theme = state.get("theme", self.theme)
+                self.wallpaper = state.get("wallpaper", self.wallpaper)
+                self.icon_positions = state.get("icon_positions", {}) or {}
+                self.icon_size = max(64, min(144, int(state.get("icon_size", self.icon_size))))
+                self.icon_scale = max(0.75, min(1.5, float(state.get("icon_scale", self.icon_scale))))
+                self.autosave_enabled = bool(state.get("autosave_enabled", self.autosave_enabled))
+                self.show_tooltips = bool(state.get("show_tooltips", self.show_tooltips))
+                self.aliases = state.get("aliases", {}) or {}
+                self.packages.installed = set(state.get("packages", []))
+                self.env_vars = state.get("env_vars", {}) or {}
+                return
+        except (OSError, ValueError):
+            pass
+        try:
+            with open(self.LEGACY_STATE_FILE, encoding="utf-8") as f:
+                legacy = json.load(f)
+            self.vfs.import_state(legacy.get("vfs", {}))
+            if legacy.get("theme") in ("default", "cyber", "retro", "matrix"):
+                self.theme = legacy["theme"]
+            if isinstance(legacy.get("wallpaper"), str):
+                self.wallpaper = legacy["wallpaper"]
+            self.icon_positions = legacy.get("icon_positions", {}) or {}
+            self.icon_size = max(64, min(144, int(legacy.get("icon_size", self.icon_size))))
+            self.icon_scale = max(0.75, min(1.5, float(legacy.get("icon_scale", self.icon_scale))))
+            self.autosave_enabled = bool(legacy.get("autosave_enabled", self.autosave_enabled))
+            self.show_tooltips = bool(legacy.get("show_tooltips", self.show_tooltips))
+            self.logger.info("состояние мигрировано из PyOS 2.2")
+        except (OSError, ValueError):
+            pass
+
+    def save_state(self) -> None:
+        state = {
+            "state_version": STATE_VERSION,
+            "vfs": self.vfs.export_state(),
+            "theme": self.theme,
+            "wallpaper": self.wallpaper,
+            "icon_positions": self.icon_positions,
+            "icon_size": self.icon_size,
+            "icon_scale": self.icon_scale,
+            "autosave_enabled": self.autosave_enabled,
+            "show_tooltips": self.show_tooltips,
+            "aliases": self.aliases,
+            "packages": sorted(self.packages.installed),
+            "env_vars": self.env_vars,
+        }
+        directory = os.path.dirname(self.STATE_FILE) or "."
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".pyos3.", dir=directory, text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.STATE_FILE)
+        except (OSError, ValueError):
+            pass
+
+    def export_snapshot(self, host_path: str) -> None:
+        snap = {
+            "state_version": STATE_VERSION,
+            "vfs": self.vfs.export_state(),
+            "users": {n: {"role": u.role, "groups": u.groups}
+                      for n, u in self.users.users.items()},
+            "packages": sorted(self.packages.installed),
+            "theme": self.theme, "wallpaper": self.wallpaper,
+        }
+        with open(host_path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+
+    def import_snapshot(self, host_path: str) -> None:
+        with open(host_path, encoding="utf-8") as f:
+            snap = json.load(f)
+        self.vfs.import_state(snap.get("vfs", {}))
+        self.packages.installed = set(snap.get("packages", []))
+        self.theme = snap.get("theme", self.theme)
+        self.wallpaper = snap.get("wallpaper", self.wallpaper)
+
+    def start_autosave(self) -> None:
+        def loop() -> None:
+            while not self._stop:
+                time.sleep(60)
+                if self._stop:
+                    break
+                if not self.autosave_enabled:
+                    continue
+                try:
+                    self.save_state()
+                except Exception as e:
+                    self.logger.error(f"autosave: {e}")
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+    def shutdown(self) -> None:
+        self._stop = True
+        self.scheduler.stop()
+        self.save_state()
+        self.bus.emit("on_shutdown")
+        self.logger.info("shutdown")
+
+
+# ============================================================
+#                    ОБОЛОЧКА (CLI)
+# ============================================================
+class Shell:
+    """Диспетчер команд: работает и в CLI, и в GUI через callback вывода."""
+
+    ANSI_RED = "\033[31m"
+    ANSI_GREEN = "\033[32m"
+    ANSI_YELLOW = "\033[33m"
+    ANSI_BLUE = "\033[34m"
+    ANSI_RESET = "\033[0m"
+
+    def __init__(self, kernel: Kernel) -> None:
+        self.k = kernel
+        self.history: list[str] = []
+        self._local = threading.local()
+        self._exit_flag = False
+
+    # ---------- вывод ----------
+    @property
+    def _out(self) -> Optional[Callable[[str], None]]:
+        return getattr(self._local, "out", None)
+
+    @_out.setter
+    def _out(self, value: Optional[Callable[[str], None]]) -> None:
+        self._local.out = value
+
+    def _print(self, s: str = "") -> None:
+        s = str(s)
+        out = self._out
+        if out is not None:
+            try:
+                out(s + "\n")
+            except Exception:
+                pass
+        else:
+            print(s)
+
+    def _color(self, text: str, code: str) -> str:
+        return f"{code}{text}{self.ANSI_RESET}" if self._out is None else text
+
+    def err(self, msg: str) -> None:
+        self._print(self._color("✕ " + msg, self.ANSI_RED))
+
+    def ok(self, msg: str) -> None:
+        self._print(self._color("✓ " + msg, self.ANSI_GREEN))
+
+    def warn(self, msg: str) -> None:
+        self._print(self._color("⚠ " + msg, self.ANSI_YELLOW))
+
+    def info(self, msg: str) -> None:
+        self._print(self._color(msg, self.ANSI_BLUE))
+
+    # ---------- выполнение ----------
+    def execute(self, line: str, out: Optional[Callable[[str], None]] = None) -> bool:
+        old = self._out
+        self._out = out
+        self._exit_flag = False
+        line = line.rstrip()
+        if line.strip():
+            self.history.append(line)
+            self._save_history(line)
+        try:
+            self._dispatch(line)
+        except (KeyboardInterrupt, EOFError):
+            self._print("\nпрервано")
+        except (PyOSError, VFSError, PermError) as e:
+            self.err(str(e))
+        except Exception as e:
+            self.logger_err("shell", e)
+            self.err(f"внутренняя ошибка: {e}")
+        finally:
+            self._out = old
+        return not self._exit_flag
+
+    def execute_silent(self, line: str) -> None:
+        """Выполняет без вывода (для scheduler). Потокобезопасно (thread-local)."""
+        old = self._out
+        self._out = lambda s: None
+        try:
+            self._dispatch(line)
+        except Exception as e:
+            self.k.logger.error(f"silent: {e}")
+        finally:
+            self._out = old
+
+    def logger_err(self, ctx: str, e: Exception) -> None:
+        self.k.logger.error(f"{ctx}: {e}\n{traceback.format_exc()}")
+
+    def _history_file(self) -> str:
+        return f"/home/{self.k.users.current}/.bash_history"
+
+    def _save_history(self, line: str) -> None:
+        try:
+            path = self._history_file()
+            cur = self.k.vfs.read(path) if self.k.vfs.exists(path) else ""
+            self.k.vfs.write(path, cur + line + "\n", system=True)
+        except Exception:
+            pass
+
+    def _load_history(self) -> None:
+        try:
+            path = self._history_file()
+            if self.k.vfs.exists(path):
+                self.history = self.k.vfs.read(path).splitlines()
+            else:
+                self.history = []
+        except Exception:
+            self.history = []
+
+    def _ask_password(self, prompt: str) -> str:
+        """Запрашивает пароль: через simpledialog в GUI, через input в CLI."""
+        if self._out is not None and tk is not None:
+            try:
+                return simpledialog.askstring("Пароль", prompt, show="•") or ""
+            except Exception:
+                pass
+        return self._ask(prompt)
+
+    def _ask(self, prompt: str) -> str:
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return ""
+
+    # ---------- диспетчер ----------
+    def _dispatch(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        first = line.split()[0]
+        if first in self.k.aliases:
+            line = self.k.aliases[first] + line[len(first):]
+        if line == "!!":
+            if len(self.history) < 2:
+                self.err("нет предыдущей команды")
+                return
+            line = self.history[-2]
+            self._print(line)
+        elif line.startswith("!") and line[1:].isdigit():
+            idx = int(line[1:])
+            if 1 <= idx <= len(self.history):
+                line = self.history[idx - 1]
+                self._print(line)
+            else:
+                self.err("нет команды с таким номером")
+                return
+        if "&&" in line:
+            for part in line.split("&&"):
+                self._dispatch(part.strip())
+            return
+        if "|" in line and not line.startswith("|"):
+            self._run_pipe(line)
+            return
+        if line.startswith("sudo "):
+            self._handle_sudo(line[5:].strip())
+            return
+        try:
+            parts = shlex.split(line)
+        except ValueError as e:
+            self.err(f"ошибка разбора: {e}")
+            return
+        if not parts:
+            return
+        cmd, args = parts[0], parts[1:]
+        handler = getattr(self, f"cmd_{cmd}", None) if cmd.isidentifier() else None
+        if handler is None:
+            self.err(f"{cmd}: команда не найдена. Введите help.")
+            return
+        handler(args)
+
+    def _run_pipe(self, line: str) -> None:
+        parts = [p.strip() for p in line.split("|")]
+        buf: list[str] = []
+        old = self._out
+
+        def capture(s: str) -> None:
+            buf.append(s)
+
+        self._out = capture
+        try:
+            for part in parts[:-1]:
+                self._dispatch(part)
+        finally:
+            self._out = old
+        last = parts[-1]
+        tokens = last.split()
+        if not tokens:
+            return
+        cmd = tokens[0]
+        if cmd == "grep" and len(tokens) >= 2:
+            pat = tokens[1].strip("'\"")
+            for l in buf:
+                if pat in l:
+                    self._print(l.rstrip("\n"))
+        elif cmd in ("head", "tail"):
+            n = 10
+            for a in tokens[1:]:
+                if a.startswith("-") and a[1:].isdigit():
+                    n = int(a[1:])
+            seq = buf[:n] if cmd == "head" else buf[-n:]
+            for l in seq:
+                self._print(l.rstrip("\n"))
+        elif cmd == "wc":
+            lines = len(buf)
+            words = sum(len(l.split()) for l in buf)
+            chars = sum(len(l) for l in buf)
+            self._print(f"{lines:>6} {words:>6} {chars:>6}")
+        elif cmd == "sort":
+            for l in sorted(buf):
+                self._print(l.rstrip("\n"))
+        elif cmd == "uniq":
+            prev = object()
+            for l in buf:
+                if l != prev:
+                    self._print(l.rstrip("\n"))
+                prev = l
+        elif cmd == "cat":
+            for l in buf:
+                self._print(l.rstrip("\n"))
+        else:
+            # неизвестная команда справа — просто печатаем содержимое
+            for l in buf:
+                self._print(l.rstrip("\n"))
+
+    def _handle_sudo(self, inner: str) -> None:
+        if self.k.users.is_admin():
+            self._dispatch(inner)
+            return
+        pwd = self._ask_password("Пароль sudo: ")
+        root_hash = self.k.users.users["root"].password_hash
+        if root_hash is None or self.k.users._h(pwd) != root_hash:
+            self.err("неверный пароль sudo")
+            return
+        old = self.k.users.current
+        self.k.users.current = "root"
+        try:
+            self._dispatch(inner)
+        finally:
+            self.k.users.current = old
+
+    # ========================================================
+    #                    КОМАНДЫ
+    # ========================================================
+    def cmd_help(self, args) -> None:
+        groups = {
+            "Файлы": "ls cd pwd mkdir touch cat rm tree cp mv find grep chmod chown ln trash head tail wc sort uniq diff",
+            "Сеть": "ping fetch net curl wget",
+            "Пакеты": "pkg",
+            "Планировщик": "schedule at bg jobs fg killjob",
+            "Процессы": "ps top kill pstree nice renice",
+            "Пользователи": "login logout su sudo passwd groups groupadd usermod",
+            "Система": "sysinfo date whoami uptime free df du mount umount history alias unalias env export system logs fsck selftest",
+            "Приложения": "edit calc notes theme files monitor settings market guess tictactoe hangman",
+            "Развлечения": "fortune figlet lolcat sl cowsay matrix",
+            "Прочее": "man which time yes seq basename dirname echo clear notify banner exit",
+        }
+        for g, cmds in groups.items():
+            self.info(f"\n── {g} ──")
+            for c in cmds.split():
+                self._print(f"  {c}")
+
+    def cmd_man(self, args) -> None:
+        if not args:
+            self.err("использование: man <команда>")
+            return
+        cmd = args[0]
+        handler = getattr(self, f"cmd_{cmd}", None)
+        if handler is None:
+            self.err(f"нет команды {cmd}")
+            return
+        doc = (handler.__doc__ or "нет описания").strip()
+        self.info(f"man {cmd}")
+        self._print(doc)
+
+    def cmd_which(self, args) -> None:
+        for c in args:
+            h = getattr(self, f"cmd_{c}", None)
+            self._print(f"/usr/bin/{c}" if h else f"{c}: not found")
+
+    def cmd_time(self, args) -> None:
+        if not args:
+            self.err("использование: time <команда>")
+            return
+        t0 = time.perf_counter()
+        self._dispatch(" ".join(args))
+        dt = time.perf_counter() - t0
+        self.info(f"real\t{dt:.3f}s")
+
+    def cmd_banner(self, args) -> None:
+        self._print(r"""
+  ____        ___  ____
+ |  _ \ _   _/ _ \/ ___|
+ | |_) | | | | | | \___ \
+ |  __/| |_| | |_| |___) |
+ |_|    \__, |\___/|____/
+        |___/    Nebula 3.0
+""")
+
+    def cmd_sysinfo(self, args) -> None:
+        up = str(datetime.timedelta(seconds=int(time.time() - self.k.started)))
+        self._print(VERSION)
+        self._print(f"Python:       {sys.version.split()[0]}")
+        self._print(f"Платформа:    {sys.platform}")
+        self._print(f"Пользователь: {self.k.users.whoami()} ({self.k.users.role()})")
+        self._print(f"Аптайм:       {up}")
+        self._print(f"Процессов:    {len(self.k.procs.procs)}")
+        self._print(f"Память:       {self.k.procs.total_mem()} MB")
+        df = self.k.vfs.df()
+        self._print(f"Файлов:       {df['files']}  ({human_size(df['bytes'])})")
+        self._print(f"Тема:         {self.k.theme}")
+
+    def cmd_date(self, args) -> None:
+        self._print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def cmd_whoami(self, args) -> None:
+        self._print(self.k.users.whoami())
+
+    def cmd_uptime(self, args) -> None:
+        up = time.time() - self.k.started
+        h = int(up // 3600)
+        m = int((up % 3600) // 60)
+        self._print(f"up {h}:{m:02d},  users: 1,  load: {random.uniform(0,1):.2f}")
+
+    def cmd_echo(self, args) -> None:
+        self._print(" ".join(args))
+
+    def cmd_clear(self, args) -> None:
+        self._print("\033[2J\033[H")
+
+    def cmd_exit(self, args) -> None:
+        self._print("Завершение сеанса PyOS...")
+        self._exit_flag = True
+
+    def cmd_yes(self, args) -> None:
+        txt = " ".join(args) or "y"
+        for _ in range(50):
+            self._print(txt)
+
+    def cmd_seq(self, args) -> None:
+        try:
+            if len(args) == 1:
+                a, b = 1, int(args[0])
+            elif len(args) == 2:
+                a, b = int(args[0]), int(args[1])
+            else:
+                raise ValueError
+        except ValueError:
+            self.err("использование: seq [start] end")
+            return
+        for i in range(a, b + 1):
+            self._print(str(i))
+
+    def cmd_basename(self, args) -> None:
+        for a in args:
+            self._print(a.rstrip("/").rsplit("/", 1)[-1])
+
+    def cmd_dirname(self, args) -> None:
+        for a in args:
+            if "/" in a:
+                self._print(a.rsplit("/", 1)[0] or "/")
+            else:
+                self._print(".")
+
+    def cmd_notify(self, args) -> None:
+        text = " ".join(args).strip()
+        if not text:
+            self.err("использование: notify <текст>")
+            return
+        if self.k.desktop_notify:
+            self.k.desktop_notify("Терминал", text)
+        else:
+            self._print(text)
+
+    # ---------- файлы ----------
+    def cmd_pwd(self, args) -> None:
+        self._print(self.k.vfs.path_str())
+
+    def cmd_ls(self, args) -> None:
+        long = False
+        hidden = False
+        for a in args:
+            if a.startswith("-") and len(a) > 1:
+                for ch in a[1:]:
+                    if ch == "l":
+                        long = True
+                    elif ch == "a":
+                        hidden = True
+        paths = [a for a in args if not a.startswith("-")] or [None]
+        for p in paths:
+            parts = self.k.vfs.resolve(p)
+            node = self.k.vfs._get(parts)
+            if node is None:
+                self.err(f"нет такого пути: {p}")
+                continue
+            if len(paths) > 1:
+                self._print(f"{p or '.'}:")
+            if node.kind != "dir":
+                items = [(parts[-1] if parts else "/", node)]
+            else:
+                items = [(n, c) for n, c in sorted(node.children.items())
+                         if hidden or not c.hidden]
+            if not items:
+                self._print("(пусто)")
+                continue
+            for name, n in items:
+                suffix = "/" if n.kind == "dir" else ("@" if n.kind == "link" else "")
+                if long:
+                    kind = "d" if n.kind == "dir" else ("l" if n.kind == "link" else "-")
+                    ts = datetime.datetime.fromtimestamp(n.mtime).strftime("%d.%m %H:%M")
+                    self._print(
+                        f"{kind}{mode_str(n.mode)} {n.owner:<6} {n.group:<6} "
+                        f"{human_size(len(n.content)):>6} {ts}  {name}{suffix}")
+                else:
+                    self._print(name + suffix)
+
+    def cmd_cd(self, args) -> None:
+        self.k.vfs.cd(args[0] if args else None)
+
+    def cmd_mkdir(self, args) -> None:
+        if not args:
+            self.err("укажите имя")
+            return
+        for a in args:
+            try:
+                self.k.vfs.mkdir(a)
+            except (VFSError, PermError) as e:
+                self.err(f"{a}: {e}")
+        self.ok("готово")
+
+    def cmd_touch(self, args) -> None:
+        if not args:
+            self.err("укажите имя")
+            return
+        for a in args:
+            try:
+                self.k.vfs.touch(a)
+            except (VFSError, PermError) as e:
+                self.err(f"{a}: {e}")
+
+    def cmd_cat(self, args) -> None:
+        if not args:
+            self.err("укажите файл")
+            return
+        for a in args:
+            try:
+                self._print(self.k.vfs.read(a).rstrip("\n"))
+            except (VFSError, PermError) as e:
+                self.err(f"{a}: {e}")
+
+    def cmd_rm(self, args) -> None:
+        recursive = any(a in ("-r", "-R", "-rf", "-fr") for a in args)
+        paths = [a for a in args if not a.startswith("-")]
+        if not paths:
+            self.err("укажите путь")
+            return
+        for p in paths:
+            try:
+                self.k.vfs.rm(p, recursive=recursive)
+            except (VFSError, PermError) as e:
+                self.err(f"{p}: {e}")
+        self.ok("операция завершена")
+
+    def cmd_tree(self, args) -> None:
+        try:
+            for line in self.k.vfs.tree_lines(args[0] if args else "/"):
+                self._print(line)
+        except VFSError as e:
+            self.err(str(e))
+
+    def cmd_cp(self, args) -> None:
+        if len(args) != 2:
+            self.err("использование: cp <src> <dst>")
+            return
+        try:
+            data = self.k.vfs.read(args[0])
+            self.k.vfs.write(args[1], data)
+            self.ok("скопировано")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_mv(self, args) -> None:
+        if len(args) != 2:
+            self.err("использование: mv <src> <dst>")
+            return
+        try:
+            data = self.k.vfs.read(args[0])
+            self.k.vfs.write(args[1], data)
+            self.k.vfs.rm(args[0], trash=False)
+            self.ok("перемещено")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_find(self, args) -> None:
+        base = "/"
+        pattern = "*"
+        rest = list(args)
+        if rest and rest[0] != "-name":
+            base = rest.pop(0)
+        if "-name" in rest:
+            i = rest.index("-name")
+            if i + 1 < len(rest):
+                pattern = rest[i + 1]
+        for p in self.k.vfs.find(base, pattern):
+            self._print(p)
+
+    def cmd_grep(self, args) -> None:
+        if len(args) < 2:
+            self.err("использование: grep <текст> <файл>")
+            return
+        pat, path = args[0], args[1]
+        try:
+            for i, line in enumerate(self.k.vfs.read(path).splitlines(), 1):
+                if pat in line:
+                    self._print(f"{i}:{line}")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_head(self, args) -> None:
+        n = 10
+        if args and args[0].startswith("-") and args[0][1:].isdigit():
+            n = int(args[0][1:])
+            args = args[1:]
+        if not args:
+            self.err("укажите файл")
+            return
+        try:
+            for line in self.k.vfs.read(args[0]).splitlines()[:n]:
+                self._print(line)
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_tail(self, args) -> None:
+        n = 10
+        if args and args[0].startswith("-") and args[0][1:].isdigit():
+            n = int(args[0][1:])
+            args = args[1:]
+        if not args:
+            self.err("укажите файл")
+            return
+        try:
+            for line in self.k.vfs.read(args[0]).splitlines()[-n:]:
+                self._print(line)
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_wc(self, args) -> None:
+        if not args:
+            self.err("укажите файл")
+            return
+        for path in args:
+            try:
+                data = self.k.vfs.read(path)
+                self._print(f"{len(data.splitlines()):>6} "
+                            f"{len(data.split()):>6} {len(data):>6} {path}")
+            except (VFSError, PermError) as e:
+                self.err(f"{path}: {e}")
+
+    def cmd_sort(self, args) -> None:
+        if not args:
+            self.err("укажите файл")
+            return
+        try:
+            for line in sorted(self.k.vfs.read(args[0]).splitlines()):
+                self._print(line)
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_uniq(self, args) -> None:
+        if not args:
+            self.err("укажите файл")
+            return
+        try:
+            prev = object()
+            for line in self.k.vfs.read(args[0]).splitlines():
+                if line != prev:
+                    self._print(line)
+                prev = line
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_diff(self, args) -> None:
+        if len(args) != 2:
+            self.err("использование: diff <a> <b>")
+            return
+        try:
+            a = self.k.vfs.read(args[0]).splitlines()
+            b = self.k.vfs.read(args[1]).splitlines()
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+            return
+        for i, (x, y) in enumerate(zip(a, b), 1):
+            if x != y:
+                self._print(f"{i}: -{x}")
+                self._print(f"{i}: +{y}")
+
+    def cmd_chmod(self, args) -> None:
+        if len(args) != 2:
+            self.err("использование: chmod <права> <файл>")
+            return
+        node = self.k.vfs._get(self.k.vfs.resolve(args[1]))
+        if node is None:
+            self.err("нет такого файла")
+            return
+        if not self.k.users.is_admin() and node.owner != self.k.users.current:
+            self.err("нужен root или владелец")
+            return
+        try:
+            node.mode = parse_mode(args[0])
+            self.ok(f"права: {mode_str(node.mode)}")
+        except ValueError as e:
+            self.err(str(e))
+
+    def cmd_chown(self, args) -> None:
+        if len(args) != 2:
+            self.err("использование: chown <user> <файл>")
+            return
+        node = self.k.vfs._get(self.k.vfs.resolve(args[1]))
+        if node is None:
+            self.err("нет такого файла")
+            return
+        if not self.k.users.is_admin():
+            self.err("нужен root")
+            return
+        node.owner = args[0]
+        self.ok("владелец изменён")
+
+    def cmd_ln(self, args) -> None:
+        if args and args[0] == "-s":
+            args = args[1:]
+        if len(args) != 2:
+            self.err("использование: ln [-s] <target> <link>")
+            return
+        target, link = args
+        try:
+            parent, name = self.k.vfs._split(link)
+            if not self.k.vfs._check_perm(parent, "w"):
+                raise PermError(f"нет прав: {link}")
+            parent.children[name] = FileNode(kind="link", link_target=target)
+            self.ok("ссылка создана")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_trash(self, args) -> None:
+        if not args or args[0] == "list":
+            items = self.k.vfs.trash_list()
+            if not items:
+                self._print("(корзина пуста)")
+            for n in items:
+                self._print(n)
+        elif args[0] == "restore":
+            if len(args) < 2:
+                self.err("укажите имя")
+                return
+            try:
+                self.k.vfs.trash_restore(args[1])
+                self.ok("восстановлено")
+            except VFSError as e:
+                self.err(str(e))
+        elif args[0] == "empty":
+            n = self.k.vfs.trash_empty()
+            self.ok(f"удалено: {n}")
+        else:
+            self.err("использование: trash list|restore <имя>|empty")
+
+    # ---------- сеть ----------
+    def cmd_ping(self, args) -> None:
+        if not args:
+            self.err("укажите хост")
+            return
+        try:
+            for line in self.k.net.ping(args[0]):
+                self._print(line)
+        except PyOSError as e:
+            self.err(str(e))
+
+    def cmd_fetch(self, args) -> None:
+        if not args:
+            self.err("использование: fetch <url>")
+            return
+        try:
+            self._print(self.k.net.fetch(args[0]))
+        except PyOSError as e:
+            self.err(str(e))
+
+    cmd_curl = cmd_fetch
+    cmd_wget = cmd_fetch
+
+    def cmd_net(self, args) -> None:
+        if not args:
+            self._print("net host add <name> | net resolve <name> | "
+                        "net listen <port> | net send <host:port> <msg> | net recv <port>")
+            return
+        sub = args[0]
+        try:
+            if sub == "host" and len(args) >= 3 and args[1] == "add":
+                ip = self.k.net.add_host(args[2])
+                self.ok(f"{args[2]} -> {ip}")
+            elif sub == "resolve" and len(args) >= 2:
+                ip = self.k.net.resolve(args[1])
+                self._print(ip or "не найдено")
+            elif sub == "listen" and len(args) >= 2:
+                self.k.net.listen(int(args[1]))
+                self.ok("слушаем")
+            elif sub == "send" and len(args) >= 3:
+                host, port = args[1].split(":")
+                self.k.net.send(host, int(port), " ".join(args[2:]))
+                self.ok("отправлено")
+            elif sub == "recv" and len(args) >= 2:
+                for m in self.k.net.recv(int(args[1])):
+                    self._print(m)
+            else:
+                self.err("неизвестная подкоманда net")
+        except (PyOSError, ValueError) as e:
+            self.err(str(e))
+
+    # ---------- пакеты ----------
+    def cmd_pkg(self, args) -> None:
+        if not args:
+            self.err("pkg list|search <q>|install <name>|remove <name>")
+            return
+        sub = args[0]
+        try:
+            if sub == "list":
+                items = self.k.packages.list_installed()
+                if not items:
+                    self._print("(нет установленных пакетов)")
+                for n in items:
+                    self._print(n)
+            elif sub == "search":
+                for n, d in self.k.packages.search(args[1] if len(args) > 1 else ""):
+                    self._print(f"{n:<12}{d}")
+            elif sub == "install" and len(args) >= 2:
+                self.k.packages.install(args[1])
+                self.ok(f"установлен: {args[1]}")
+            elif sub == "remove" and len(args) >= 2:
+                self.k.packages.remove(args[1])
+                self.ok("удалён")
+            else:
+                self.err("неизвестная подкоманда pkg")
+        except PyOSError as e:
+            self.err(str(e))
+
+    # ---------- планировщик ----------
+    def cmd_schedule(self, args) -> None:
+        if not args:
+            self.err("schedule add \"M H D Mo W\" <команда> | schedule list | schedule del <id>")
+            return
+        try:
+            if args[0] == "add" and len(args) >= 3:
+                jid = self.k.scheduler.add_cron(args[1], " ".join(args[2:]))
+                self.ok(f"job {jid}")
+            elif args[0] == "list":
+                for j in self.k.scheduler.list_jobs():
+                    self._print(f"{j.id:>3} {j.kind:<5} {j.spec:<20} "
+                                f"runs={j.runs} cmd={j.command}")
+            elif args[0] == "del" and len(args) >= 2:
+                if self.k.scheduler.remove(int(args[1])):
+                    self.ok("удалено")
+                else:
+                    self.err("нет такой задачи")
+        except (PyOSError, ValueError) as e:
+            self.err(str(e))
+
+    def cmd_at(self, args) -> None:
+        if len(args) < 2:
+            self.err("at HH:MM|+сек <команда>")
+            return
+        try:
+            jid = self.k.scheduler.add_at(args[0], " ".join(args[1:]))
+            self.ok(f"job {jid}")
+        except PyOSError as e:
+            self.err(str(e))
+
+    def cmd_bg(self, args) -> None:
+        if not args:
+            self.err("bg <команда>")
+            return
+        jid = self.k.scheduler.add_bg(" ".join(args))
+        self.ok(f"bg job {jid}")
+
+    def cmd_jobs(self, args) -> None:
+        for j in self.k.scheduler.list_jobs():
+            self._print(f"{j.id:>3} {j.kind:<5} {j.spec:<20} runs={j.runs} cmd={j.command}")
+
+    def cmd_fg(self, args) -> None:
+        if not args:
+            self.err("fg <id>")
+            return
+        j = self.k.scheduler.jobs.get(int(args[0])) if args[0].isdigit() else None
+        if not j:
+            self.err("нет такой задачи")
+            return
+        self.info(f"job {j.id}: {j.command}")
+
+    def cmd_killjob(self, args) -> None:
+        if not args:
+            self.err("killjob <id>")
+            return
+        if self.k.scheduler.remove(int(args[0])):
+            self.ok("удалено")
+        else:
+            self.err("нет такой задачи")
+
+    # ---------- процессы ----------
+    def cmd_ps(self, args) -> None:
+        self._print(f"{'PID':>5} {'USER':<8} {'NICE':>4} {'MEM':>5} {'STATE':<9} NAME")
+        for p in self.k.procs.procs:
+            self._print(f"{p.pid:>5} {p.user:<8} {p.nice:>4} {p.mem:>4}M "
+                        f"{p.state:<9} {p.name}")
+
+    def cmd_top(self, args) -> None:
+        self.cmd_ps(args)
+        self._print(f"\nПамять: {self.k.procs.total_mem()} MB")
+
+    def cmd_pstree(self, args) -> None:
+        for line in self.k.procs.pstree():
+            self._print(line)
+
+    def cmd_kill(self, args) -> None:
+        sig = "TERM"
+        args = list(args)
+        if "-9" in args:
+            sig = "KILL"
+            args.remove("-9")
+        elif "-STOP" in args:
+            sig = "STOP"
+            args.remove("-STOP")
+        elif "-CONT" in args:
+            sig = "CONT"
+            args.remove("-CONT")
+        if not args:
+            self.err("укажите PID")
+            return
+        try:
+            pid = int(args[0])
+        except ValueError:
+            self.err("PID должен быть числом")
+            return
+        if not self.k.users.is_admin():
+            p = self.k.procs.find(pid)
+            if p and p.user != self.k.users.current:
+                self.err("нет прав")
+                return
+        ok, msg = self.k.procs.kill(pid, sig)
+        (self.ok if ok else self.err)(msg)
+
+    def cmd_nice(self, args) -> None:
+        if len(args) < 2:
+            self.err("nice <pid> <value>")
+            return
+        try:
+            self.k.procs.renice(int(args[0]), int(args[1]))
+            self.ok("приоритет изменён")
+        except (PyOSError, ValueError) as e:
+            self.err(str(e))
+
+    cmd_renice = cmd_nice
+
+    # ---------- пользователи ----------
+    def cmd_login(self, args) -> None:
+        if not args:
+            self.err("login <user> [pass]")
+            return
+        ok, msg = self.k.users.login(args[0], args[1] if len(args) > 1 else "")
+        (self.ok if ok else self.err)(msg)
+        if ok:
+            self._load_history()
+
+    def cmd_logout(self, args) -> None:
+        self.k.users.current = "guest"
+        self._load_history()
+        self.ok("вы вышли")
+
+    def cmd_su(self, args) -> None:
+        if not args:
+            self.err("su <user> [pass]")
+            return
+        self.cmd_login(args)
+
+    def cmd_passwd(self, args) -> None:
+        user = args[0] if args else self.k.users.current
+        if user != self.k.users.current and not self.k.users.is_admin():
+            self.err("нужен root")
+            return
+        p1 = self._ask_password("Новый пароль: ")
+        if not p1:
+            self.err("отменено")
+            return
+        p2 = self._ask_password("Повторите: ")
+        if p1 != p2:
+            self.err("не совпадают")
+            return
+        self.k.users.set_password(user, p1)
+        self.ok("пароль изменён")
+
+    def cmd_groups(self, args) -> None:
+        user = args[0] if args else self.k.users.current
+        self._print(" ".join(self.k.users.user_groups(user)))
+
+    def cmd_groupadd(self, args) -> None:
+        if not args:
+            self.err("groupadd <name>")
+            return
+        self.k.users.add_group(args[0])
+        self.ok("группа создана")
+
+    def cmd_usermod(self, args) -> None:
+        if len(args) >= 3 and args[0] == "-aG":
+            self.k.users.add_user_to_group(args[2], args[1])
+            self.ok("добавлен в группу")
+        else:
+            self.err("usermod -aG <group> <user>")
+
+    # ---------- система ----------
+    def cmd_free(self, args) -> None:
+        used = self.k.procs.total_mem()
+        self._print("              total        used        free")
+        self._print(f"Mem:        {512:>6}M {used:>10}M {512 - used:>10}M")
+
+    def cmd_df(self, args) -> None:
+        d = self.k.vfs.df()
+        self._print("Filesystem     Files   Dirs   Size")
+        self._print(f"pyos-vfs    {d['files']:>7} {d['dirs']:>6} {human_size(d['bytes']):>6}")
+
+    def cmd_du(self, args) -> None:
+        path = args[0] if args else self.k.vfs.path_str()
+        total = 0
+        for _, n in self.k.vfs.walk(path):
+            total += len(n.content)
+        self._print(f"{human_size(total)}\t{path}")
+
+    def cmd_mount(self, args) -> None:
+        if not args:
+            self._print("pyos-vfs on / type virtual (rw)")
+            return
+        name = args[0]
+        try:
+            self.k.vfs.mkdir_p(f"/mnt/{name}")
+            self.ok(f"примонтирован виртуальный диск в /mnt/{name}")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_umount(self, args) -> None:
+        if not args:
+            self.err("umount <name>")
+            return
+        try:
+            self.k.vfs.rm(f"/mnt/{args[0]}", recursive=True, trash=False)
+            self.ok("отмонтирован")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_history(self, args) -> None:
+        for i, line in enumerate(self.history, 1):
+            self._print(f"{i:>5}  {line}")
+
+    def cmd_alias(self, args) -> None:
+        if not args:
+            for k, v in self.k.aliases.items():
+                self._print(f"alias {k}='{v}'")
+            return
+        if "=" in args[0]:
+            name, val = args[0].split("=", 1)
+            self.k.aliases[name] = val.strip("'\"")
+            self.ok("алиас создан")
+        else:
+            self.err("использование: alias name='команда'")
+
+    def cmd_unalias(self, args) -> None:
+        if args and args[0] in self.k.aliases:
+            del self.k.aliases[args[0]]
+            self.ok("удалён")
+
+    def cmd_env(self, args) -> None:
+        self._print(f"USER={self.k.users.current}")
+        self._print(f"HOME=/home/{self.k.users.current}")
+        self._print(f"PWD={self.k.vfs.path_str()}")
+        self._print(f"PYOS_VERSION={VERSION}")
+        for name, val in self.k.env_vars.items():
+            self._print(f"{name}={val}")
+
+    def cmd_export(self, args) -> None:
+        """Экспорт файла VFS на хост ИЛИ установка переменной окружения (NAME=value)."""
+        if not args:
+            self.err("export <vpath> <hostpath>  |  export NAME=value")
+            return
+        if len(args) == 2 and "=" not in args[0]:
+            vpath, host = args
+            try:
+                with open(host, "w", encoding="utf-8") as f:
+                    f.write(self.k.vfs.read(vpath))
+                self.ok(f"экспортировано в {host}")
+            except (OSError, VFSError, PermError) as e:
+                self.err(str(e))
+        else:
+            for a in args:
+                if "=" in a:
+                    name, val = a.split("=", 1)
+                    self.k.env_vars[name] = val
+                    self.ok(f"{name}={val}")
+                else:
+                    self.err(f"неверный формат: {a}")
+
+    def cmd_import(self, args) -> None:
+        if len(args) != 2:
+            self.err("import <hostpath> <vpath>")
+            return
+        host, vpath = args
+        try:
+            with open(host, encoding="utf-8") as f:
+                self.k.vfs.write(vpath, f.read())
+            self.ok("импортировано")
+        except (OSError, VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_system(self, args) -> None:
+        if not args:
+            self.err("system export <файл> | system import <файл>")
+            return
+        try:
+            if args[0] == "export" and len(args) >= 2:
+                self.k.export_snapshot(args[1])
+                self.ok("снапшот сохранён")
+            elif args[0] == "import" and len(args) >= 2:
+                self.k.import_snapshot(args[1])
+                self.ok("снапшот загружен")
+            else:
+                self.err("использование: system export|import <файл>")
+        except Exception as e:
+            self.err(str(e))
+
+    def cmd_logs(self, args) -> None:
+        try:
+            data = self.k.vfs.read("/var/log/pyos.log")
+        except VFSError:
+            self.err("лог пуст")
+            return
+        lines = data.splitlines()
+        level = None
+        tail = 30
+        if "--tail" in args:
+            i = args.index("--tail")
+            try:
+                tail = int(args[i + 1])
+            except (IndexError, ValueError):
+                pass
+        if "--level" in args:
+            i = args.index("--level")
+            if i + 1 < len(args):
+                level = args[i + 1]
+        for line in lines[-tail:]:
+            if level and f"[{level}]" not in line:
+                continue
+            self._print(line)
+
+    def cmd_fsck(self, args) -> None:
+        issues = 0
+        for parts, node in self.k.vfs.walk("/"):
+            if node.kind == "dir":
+                for name in list(node.children.keys()):
+                    if not isinstance(name, str):
+                        del node.children[name]
+                        issues += 1
+        self.ok(f"fsck завершён, проблем: {issues}")
+
+    def cmd_selftest(self, args) -> None:
+        checks = []
+        try:
+            self.k.vfs.write("/tmp/_selftest", "ok", system=True)
+            assert self.k.vfs.read("/tmp/_selftest") == "ok"
+            self.k.vfs.rm("/tmp/_selftest", trash=False)
+            checks.append(("VFS", True))
+        except Exception:
+            checks.append(("VFS", False))
+        try:
+            pid = self.k.procs.spawn("selftest", 1, self.k.users.current)
+            self.k.procs.kill(pid)
+            checks.append(("Procs", True))
+        except Exception:
+            checks.append(("Procs", False))
+        try:
+            jid = self.k.scheduler.add_at("+1", "echo test")
+            self.k.scheduler.remove(jid)
+            checks.append(("Scheduler", True))
+        except Exception:
+            checks.append(("Scheduler", False))
+        try:
+            ip = self.k.net.add_host("selftest-host")
+            assert self.k.net.resolve("selftest-host") == ip
+            checks.append(("Net", True))
+        except Exception:
+            checks.append(("Net", False))
+        try:
+            self.k.packages.search("hello")
+            checks.append(("Packages", True))
+        except Exception:
+            checks.append(("Packages", False))
+        for name, ok in checks:
+            self._print(f"[{'OK' if ok else 'FAIL'}] {name}")
+
+    # ---------- приложения ----------
+    def cmd_theme(self, args) -> None:
+        if not args:
+            self._print(f"Текущая тема: {self.k.theme} (dark|light)")
+            return
+        if args[0] in ("dark", "light"):
+            self.k.theme = args[0]
+            self.ok("тема переключена")
+        else:
+            self.err("доступно: dark, light")
+
+    def cmd_files(self, args) -> None:
+        if self.k.launcher and self.k.launcher("files"):
+            return
+        self.err("доступно только в GUI")
+
+    def cmd_monitor(self, args) -> None:
+        if self.k.launcher and self.k.launcher("monitor"):
+            return
+        self.err("доступно только в GUI")
+
+    def cmd_settings(self, args) -> None:
+        if self.k.launcher and self.k.launcher("settings"):
+            return
+        self.err("доступно только в GUI")
+
+    def cmd_market(self, args) -> None:
+        if self.k.launcher and self.k.launcher("market"):
+            return
+        self.err("доступно только в GUI")
+
+    def cmd_edit(self, args) -> None:
+        if not args:
+            self.err("edit <файл>")
+            return
+        if self.k.launcher and self.k.launcher("edit", args[0]):
+            return
+        self._print("(CLI-редактор: '.' — сохранить, '!q' — отмена)")
+        try:
+            self._print(self.k.vfs.read(args[0]))
+        except (VFSError, PermError):
+            pass
+        lines: list[str] = []
+        while True:
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if line == ".":
+                break
+            if line == "!q":
+                return
+            lines.append(line)
+        try:
+            self.k.vfs.write(args[0], "\n".join(lines) + ("\n" if lines else ""))
+            self.ok("сохранено")
+        except (VFSError, PermError) as e:
+            self.err(str(e))
+
+    def cmd_calc(self, args) -> None:
+        if args:
+            try:
+                self._print(fmt_num(safe_eval(" ".join(args))))
+            except Exception as e:
+                self.err(str(e))
+            return
+        if self.k.launcher and self.k.launcher("calc"):
+            return
+        self._print("Калькулятор. Пустая строка — выход.")
+        while True:
+            try:
+                expr = input("calc> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not expr:
+                return
+            try:
+                self._print(fmt_num(safe_eval(expr)))
+            except Exception as e:
+                self.err(str(e))
+
+    def cmd_notes(self, args) -> None:
+        if not args and self.k.launcher and self.k.launcher("notes"):
+            return
+        path = f"/home/{self.k.users.current}/notes_db.json"
+        try:
+            db = json.loads(self.k.vfs.read(path)) if self.k.vfs.exists(path) else []
+            if not isinstance(db, list):
+                db = []
+        except Exception:
+            db = []
+        if not args or args[0] == "list":
+            if not db:
+                self._print("(заметок нет)")
+            for i, n in enumerate(db, 1):
+                self._print(f"{i}. [{n.get('t', '?')}] {n.get('text', '')}")
+        elif args[0] == "add":
+            txt = " ".join(args[1:]).strip()
+            if not txt:
+                self.err("укажите текст")
+                return
+            db.append({"t": now_iso(), "text": txt})
+            self.k.vfs.write(path, json.dumps(db, ensure_ascii=False, indent=2))
+            self.ok("добавлено")
+        elif args[0] == "del":
+            try:
+                i = int(args[1]) - 1
+                db.pop(i)
+                self.k.vfs.write(path, json.dumps(db, ensure_ascii=False, indent=2))
+                self.ok("удалено")
+            except Exception:
+                self.err("нет такой заметки")
+
+    def cmd_guess(self, args) -> None:
+        if self.k.launcher and self.k.launcher("guess"):
+            return
+        secret = random.randint(1, 100)
+        self._print("Угадайте число 1..100")
+        while True:
+            try:
+                raw = input("число> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not raw:
+                return
+            try:
+                n = int(raw)
+            except ValueError:
+                continue
+            if n < secret:
+                self._print("Больше")
+            elif n > secret:
+                self._print("Меньше")
+            else:
+                self.ok("Угадали!")
+                return
+
+    def cmd_tictactoe(self, args) -> None:
+        if self.k.launcher and self.k.launcher("tictactoe"):
+            return
+        self._print("Крестики-нолики: X — вы, O — компьютер")
+        board = [" "] * 9
+        lines = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6),
+                 (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+
+        def render():
+            return "\n".join(" | ".join(board[r * 3:r * 3 + 3]) for r in range(3))
+
+        def winner():
+            for a, b, c in lines:
+                if board[a] != " " and board[a] == board[b] == board[c]:
+                    return board[a]
+            return None
+
+        while " " in board and not winner():
+            self._print(render())
+            try:
+                raw = input("клетка 1-9> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not raw.isdigit() or not 1 <= int(raw) <= 9 or board[int(raw) - 1] != " ":
+                continue
+            board[int(raw) - 1] = "X"
+            if " " in board and not winner():
+                free = [i for i, v in enumerate(board) if v == " "]
+                board[random.choice(free)] = "O"
+        self._print(render())
+        w = winner()
+        self._print("Победа!" if w == "X" else "Победа компьютера" if w == "O" else "Ничья")
+
+    def cmd_hangman(self, args) -> None:
+        if self.k.launcher and self.k.launcher("hangman"):
+            return
+        words = ["питон", "компьютер", "терминал", "память", "ядро"]
+        word = random.choice(words)
+        guessed: set[str] = set()
+        wrong: set[str] = set()
+        while True:
+            masked = " ".join(c if c in guessed else "_" for c in word)
+            self._print(f"{masked}  ошибки: {' '.join(sorted(wrong)) or '-'}")
+            if all(c in guessed for c in word):
+                self.ok("Победа!")
+                return
+            if len(wrong) >= 6:
+                self.err(f"Проигрыш. Слово: {word}")
+                return
+            try:
+                ch = input("буква> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if len(ch) != 1 or ch in guessed or ch in wrong:
+                continue
+            (guessed if ch in word else wrong).add(ch)
+
+    def cmd_fortune(self, args) -> None:
+        quotes = [
+            "Простота — залог надёжности.",
+            "Преждевременная оптимизация — корень всех зол.",
+            "Явное лучше неявного.",
+            "Читаемость имеет значение.",
+        ]
+        self._print(random.choice(quotes))
+
+    def cmd_figlet(self, args) -> None:
+        text = " ".join(args) or "PyOS"
+        self._print("█" * (len(text) + 4))
+        self._print("█ " + text + " █")
+        self._print("█" * (len(text) + 4))
+
+    def cmd_lolcat(self, args) -> None:
+        text = " ".join(args) or "meow"
+        colors = "\033[91m\033[93m\033[92m\033[96m\033[94m\033[95m"
+        line = ""
+        for i, ch in enumerate(text):
+            line += f"{colors[i % len(colors)]}{ch}\033[0m"
+        self._print(line)
+
+    def cmd_sl(self, args) -> None:
+        self._print("🚂  Choo choo! (вы хотели ls?)")
+
+    def cmd_cowsay(self, args) -> None:
+        text = " ".join(args) or "Moo!"
+        line = "-" * (len(text) + 2)
+        self._print(f" {line}")
+        self._print(f"< {text} >")
+        self._print(f" {line}")
+        self._print("        \\   ^__^")
+        self._print("         \\  (oo)\\_______")
+        self._print("            (__)\\       )\\/\\")
+        self._print("                ||----w |")
+        self._print("                ||     ||")
+
+    def cmd_matrix(self, args) -> None:
+        chars = "01アイウエオカキクケコサシスセソ"
+        for _ in range(30):
+            self._print("".join(random.choice(chars) for _ in range(60)))
+            time.sleep(0.02)
+        self._print("Wake up, Neo...")
+
+    # ---------- CLI ----------
+    def repl(self) -> None:
+        """Интерактивный терминал."""
+        self.execute("banner")
+        self._load_history()
+        try:
+            motd = self.k.vfs.read("/etc/motd").strip()
+            if motd:
+                self.info(motd)
+        except VFSError:
+            pass
+        while True:
+            prompt = f"{self.k.users.prompt()} {self.k.vfs.path_str()}> "
+            try:
+                line = input(prompt)
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not self.execute(line):
+                break
+
+
+# ============================================================
+#                    GUI: КОНСТАНТЫ
+# ============================================================
+BG_DESKTOP = "#1e2a3a"
+BG_TASKBAR = "#0b1220"
+MENU_BG = "#2f3338"
+MENU_HOVER = "#3f454d"
+BG_WINDOW = "#f0f0f0"
+FG_TASKBAR = "#e0e6ed"
+ACCENT = "#3b82f6"
+ACCENT_DARK = "#2563eb"
+ICON_BG = "#2a3a4f"
+ICON_HOVER = "#3b82f6"
+TASK_IDLE = "#1f2b3a"
+TASK_MIN = "#141c28"
+FONT = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+TASKBAR_H = 44
+
+WALLPAPERS = {
+    "nebula": "#1e2a3a",
+    "sunset": "#45213a",
+    "matrix": "#001b12",
+    "ocean": "#0c2340",
+    "paper": "#e8e0d0",
+}
+
+
+def round_rect(canvas, x1, y1, x2, y2, r, **kw):
+    pts = [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1,
+           x2, y1 + r, x2, y1 + r, x2, y2 - r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2, x1, y2,
+           x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
+    return canvas.create_polygon(pts, smooth=True, **kw)
+
+
+def centered(parent):
+    f = tk.Frame(parent, bg=BG_WINDOW)
+    f.place(relx=0.5, rely=0.5, anchor="center")
+    return f
+
+
+# ============================================================
+#                    ИКОНКА РАБОЧЕГО СТОЛА
+# ============================================================
+class DesktopIcon:
+    """Ярлык на Canvas с drag-n-drop."""
+
+    def __init__(self, canvas, title, icon, callback, x, y, moved=None,
+                 size=96, scale=1.0) -> None:
+        self.callback = callback
+        self.canvas = canvas
+        self._moved = moved
+        self._drag = None
+        self._icon_width = max(64, int(size * scale))
+        self._icon_height = self._icon_width
+        self.frame = tk.Frame(canvas, bg=ICON_BG, width=self._icon_width,
+                              height=self._icon_height, cursor="hand2")
+        self.frame.pack_propagate(False)
+        self.lbl_icon = tk.Label(self.frame, text=icon, bg=ICON_BG, fg="white",
+                                 font=("Segoe UI", 26))
+        self.lbl_icon.pack(pady=(8, 0))
+        self.lbl_name = tk.Label(self.frame, text=title, bg=ICON_BG, fg="white",
+                                 font=FONT, wraplength=88)
+        self.lbl_name.pack(pady=(2, 0))
+        self.widgets = (self.frame, self.lbl_icon, self.lbl_name)
+        for w in self.widgets:
+            w.bind("<Double-Button-1>", lambda e: self.callback())
+            w.bind("<Button-1>", self._drag_start)
+            w.bind("<B1-Motion>", self._drag_move)
+            w.bind("<ButtonRelease-1>", self._drag_end)
+            w.bind("<Enter>", lambda e: self._paint(ICON_HOVER))
+            w.bind("<Leave>", self._hover_off)
+        self.item = canvas.create_window(x, y, window=self.frame, anchor="nw")
+
+    def _clamp(self, x, y):
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        grid = max(16, self._icon_width + 14)
+        usable_h = max(0, H - TASKBAR_H)
+        x = round(max(0, min(x, max(0, W - self._icon_width))) / grid) * grid
+        y = round(max(0, min(y, max(0, usable_h - self._icon_height))) / grid) * grid
+        return (max(0, min(x, max(0, W - self._icon_width))),
+                max(0, min(y, max(0, usable_h - self._icon_height))))
+
+    def _drag_start(self, e) -> None:
+        x, y = self.canvas.coords(self.item)
+        self._drag = (e.x_root, e.y_root, x, y)
+
+    def _drag_move(self, e) -> None:
+        if not self._drag:
+            return
+        sx, sy, x, y = self._drag
+        x, y = self._clamp(x + e.x_root - sx, y + e.y_root - sy)
+        self.canvas.coords(self.item, x, y)
+
+    def _drag_end(self, e) -> None:
+        if self._drag:
+            _, _, x, y = self._drag
+            x, y = self._clamp(x + e.x_root - self._drag[0],
+                               y + e.y_root - self._drag[1])
+            self.canvas.coords(self.item, x, y)
+            if self._moved:
+                self._moved(x, y)
+        self._drag = None
+
+    def _paint(self, color: str) -> None:
+        for w in self.widgets:
+            w.config(bg=color)
+
+    def _hover_off(self, event=None) -> None:
+        try:
+            px, py = self.frame.winfo_pointerxy()
+            under = self.frame.winfo_containing(px, py)
+        except (tk.TclError, KeyError):
+            under = None
+        if under not in self.widgets:
+            self._paint(ICON_BG)
+
+
+# ============================================================
+#                    ОКНО ПРИЛОЖЕНИЯ
+# ============================================================
+class AppWindow(tk.Toplevel if tk else object):
+    """Окно приложения с кастомной рамкой, snap-зонами."""
+
+    def __init__(self, desktop, title: str, icon: str = "📄", mem: int = 12) -> None:
+        super().__init__(desktop.root)
+        self.desktop = desktop
+        self.kernel = desktop.os
+        self._closed = False
+        self._maximized = False
+        self._normal_geom: Optional[str] = None
+        self.btn_max = None
+        self._off = (0, 0)
+        self._snapped: Optional[str] = None
+        self._presnap_size: Optional[tuple] = None
+
+        self.title(title)
+        self.configure(bg=BG_WINDOW)
+        if not NATIVE:
+            self.overrideredirect(True)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.pid = self.kernel.procs.spawn(title, mem, self.kernel.users.current)
+
+        if not NATIVE:
+            self.titlebar = tk.Frame(self, bg=ACCENT, height=32)
+            self.titlebar.pack(fill="x")
+            self.titlebar.pack_propagate(False)
+            self.title_lbl = tk.Label(self.titlebar, text=f"{icon}  {title}",
+                                      bg=ACCENT, fg="white", font=FONT_BOLD)
+            self.title_lbl.pack(side="left", padx=8)
+            tk.Button(self.titlebar, text="✕", bg=ACCENT, fg="white", bd=0,
+                      activebackground="#ef4444", font=FONT_BOLD,
+                      command=self.close).pack(side="right", padx=2)
+            self.btn_max = tk.Button(self.titlebar, text="❐", bg=ACCENT, fg="white",
+                                     bd=0, activebackground=ACCENT_DARK,
+                                     font=FONT_BOLD, command=self.toggle_maximize)
+            self.btn_max.pack(side="right", padx=2)
+            tk.Button(self.titlebar, text="—", bg=ACCENT, fg="white", bd=0,
+                      activebackground=ACCENT_DARK, font=FONT_BOLD,
+                      command=self.minimize).pack(side="right", padx=2)
+            for w in (self.titlebar, self.title_lbl):
+                w.bind("<Button-1>", self._drag_start)
+                w.bind("<B1-Motion>", self._drag_move)
+                w.bind("<Double-Button-1>", lambda e: self.toggle_maximize())
+
+        self.body = tk.Frame(self, bg=BG_WINDOW)
+        self.body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self._place_default()
+        desktop.register_window(self)
+        self.after(80, self._take_focus)
+
+    def _take_focus(self) -> None:
+        try:
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def open_maximized(self) -> None:
+        root = self.desktop.root
+        root.update_idletasks()
+        w = root.winfo_width()
+        h = root.winfo_height() - TASKBAR_H - (40 if NATIVE else 0)
+        self.geometry(f"{w}x{h}+{root.winfo_rootx()}+{root.winfo_rooty()}")
+        self._maximized = True
+        if self.btn_max:
+            self.btn_max.config(text="❐")
+
+    def _place_default(self) -> None:
+        root = self.desktop.root
+        root.update_idletasks()
+        sw = root.winfo_width()
+        sh = root.winfo_height() - TASKBAR_H - (40 if NATIVE else 0)
+        w = min(820, max(360, sw - 120))
+        h = min(560, max(260, sh - 100))
+        n = len(self.desktop.windows)
+        x = root.winfo_rootx() + 60 + (n * 32) % max(40, sw - w - 100)
+        y = root.winfo_rooty() + 40 + (n * 32) % max(40, sh - h - 100)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self._maximized = False
+        if self.btn_max:
+            self.btn_max.config(text="⛶")
+
+    def toggle_maximize(self) -> None:
+        if self._maximized:
+            self.geometry(self._normal_geom or "640x420+120+80")
+            self._maximized = False
+            if self.btn_max:
+                self.btn_max.config(text="⛶")
+        else:
+            self._normal_geom = self.geometry()
+            self.open_maximized()
+
+    def _drag_start(self, e) -> None:
+        self._off = (e.x_root - self.winfo_x(), e.y_root - self.winfo_y())
+        if self._snapped:
+            self._unsnap(e)
+
+    def _drag_move(self, e) -> None:
+        if self._maximized:
+            return
+        root = self.desktop.root
+        rx = root.winfo_rootx()
+        ry = root.winfo_rooty()
+        rw = root.winfo_width()
+        at_left = e.x_root <= rx + 8
+        at_right = e.x_root >= rx + rw - 8
+        at_top = e.y_root <= ry + 4
+        if at_left or at_right:
+            self._snap("left" if at_left else "right")
+            return
+        if at_top:
+            self.open_maximized()
+            return
+        if self._snapped:
+            return
+        self.geometry(f"+{e.x_root - self._off[0]}+{e.y_root - self._off[1]}")
+
+    def _snap(self, side: str) -> None:
+        if self._snapped == side:
+            return
+        if not self._snapped:
+            self._presnap_size = (self.winfo_width(), self.winfo_height())
+        root = self.desktop.root
+        root.update_idletasks()
+        w = root.winfo_width() // 2
+        h = root.winfo_height() - TASKBAR_H - (40 if NATIVE else 0)
+        x = root.winfo_rootx() + (0 if side == "left" else root.winfo_width() - w)
+        self.geometry(f"{w}x{h}+{x}+{root.winfo_rooty()}")
+        self._snapped = side
+
+    def _unsnap(self, e) -> None:
+        w, h = self._presnap_size or (760, 540)
+        self._snapped = None
+        self._off = (max(30, w // 3), 20)
+        self.geometry(f"{w}x{h}+{e.x_root - self._off[0]}+{e.y_root - self._off[1]}")
+
+    def minimize(self) -> None:
+        self.withdraw()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.desktop.unregister_window(self)
+        try:
+            self.kernel.procs.kill(self.pid)
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+# ============================================================
+#                    ПРИЛОЖЕНИЯ
+# ============================================================
+def open_terminal(desktop, *_) -> None:
+    w = AppWindow(desktop, "Терминал", "🖥", mem=14)
+    kernel = desktop.os
+    bar = tk.Frame(w.body, bg="#0b1220")
+    bar.pack(side="bottom", fill="x", pady=(6, 0))
+    prompt_lbl = tk.Label(bar, bg="#0b1220", fg="#7dd3fc", font=("Consolas", 11))
+    prompt_lbl.pack(side="left")
+    entry = tk.Entry(bar, bg="#0b1220", fg="#7dd3fc", insertbackground="#7dd3fc",
+                     font=("Consolas", 11), bd=0)
+    entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+    sb = tk.Scrollbar(w.body)
+    sb.pack(side="right", fill="y")
+    out = tk.Text(w.body, bg="#0b1220", fg="#7dd3fc", font=("Consolas", 11),
+                  bd=0, wrap="word", state="disabled", padx=8, pady=6,
+                  yscrollcommand=sb.set)
+    out.pack(fill="both", expand=True)
+    sb.config(command=out.yview)
+
+    def write(s: str) -> None:
+        try:
+            out.config(state="normal")
+            if "\033[2J" in s:
+                out.delete("1.0", "end")
+                s = s.replace("\033[2J", "").replace("\033[H", "")
+            out.insert("end", s)
+            out.config(state="disabled")
+            out.see("end")
+        except tk.TclError:
+            pass
+
+    def refresh_prompt():
+        prompt_lbl.config(text=f"{kernel.users.prompt()} {kernel.vfs.path_str()}>")
+
+    def submit(event=None) -> None:
+        line = entry.get()
+        entry.delete(0, "end")
+        write(f"{kernel.users.prompt()} {kernel.vfs.path_str()}> {line}\n")
+        alive = kernel.shell.execute(line, out=write)
+        if w._closed:
+            return
+        if not alive:
+            w.close()
+            return
+        refresh_prompt()
+
+    def hist_up(event):
+        h = kernel.shell.history
+        if h:
+            entry.delete(0, "end")
+            entry.insert(0, h[-1])
+        return "break"
+
+    def autocomplete(event):
+        text = entry.get()
+        if " " in text:
+            return
+        cmds = [m[4:] for m in dir(kernel.shell) if m.startswith("cmd_")]
+        matches = [c for c in cmds if c.startswith(text)]
+        if len(matches) == 1:
+            entry.delete(0, "end")
+            entry.insert(0, matches[0] + " ")
+        elif matches:
+            write("  ".join(matches) + "\n")
+        return "break"
+
+    entry.bind("<Return>", submit)
+    entry.bind("<Up>", hist_up)
+    entry.bind("<Tab>", autocomplete)
+    kernel.shell.execute("banner", out=write)
+    refresh_prompt()
+    w.after(120, entry.focus_set)
+
+
+def open_calc(desktop, *_) -> None:
+    w = AppWindow(desktop, "Калькулятор", "🧮", mem=8)
+    box = centered(w.body)
+    disp = tk.Entry(box, font=("Segoe UI", 24), bd=0, bg="#0b1220", fg="white",
+                    justify="right", insertbackground="white", width=14)
+    disp.grid(row=0, column=0, columnspan=4, sticky="nsew", ipady=14, pady=(0, 8))
+    err = [False]
+
+    def set_text(text: str, is_error: bool = False) -> None:
+        disp.delete(0, "end")
+        disp.insert(0, text)
+        err[0] = is_error
+
+    def press(ch: str) -> None:
+        if err[0]:
+            set_text("")
+        if ch == "=":
+            expr = disp.get()
+            if not expr.strip():
+                return
+            try:
+                set_text(fmt_num(safe_eval(expr)))
+            except ZeroDivisionError:
+                set_text("Деление на 0", True)
+            except Exception:
+                set_text("Ошибка", True)
+        elif ch == "C":
+            set_text("")
+        elif ch == "⌫":
+            s = disp.get()
+            if s:
+                disp.delete(len(s) - 1, "end")
+        else:
+            disp.insert("end", ch)
+
+    keys = [["C", "(", ")", "/"], ["7", "8", "9", "*"], ["4", "5", "6", "-"],
+            ["1", "2", "3", "+"], ["0", ".", "⌫", "="]]
+    for r, row in enumerate(keys, start=1):
+        for c, k in enumerate(row):
+            tk.Button(box, text=k, width=5, height=1, font=("Segoe UI", 16, "bold"),
+                      command=lambda k=k: press(k)
+                      ).grid(row=r, column=c, sticky="nsew", padx=3, pady=3)
+    disp.bind("<Return>", lambda e: press("="))
+    w.after(120, disp.focus_set)
+
+
+def open_notes(desktop, *_) -> None:
+    w = AppWindow(desktop, "Заметки", "🗒", mem=10)
+    kernel = desktop.os
+    lb = tk.Listbox(w.body, font=("Consolas", 11), bd=0)
+    lb.pack(fill="both", expand=True)
+
+    def notes_path():
+        return f"/home/{kernel.users.current}/notes_db.json"
+
+    def load():
+        try:
+            return json.loads(kernel.vfs.read(notes_path()))
+        except Exception:
+            return []
+
+    def save(db):
+        try:
+            kernel.vfs.write(notes_path(), json.dumps(db, ensure_ascii=False, indent=2))
+        except (VFSError, PermError) as e:
+            messagebox.showerror("Заметки", str(e), parent=w)
+
+    def refresh():
+        lb.delete(0, "end")
+        for n in load():
+            lb.insert("end", f"[{n.get('t','?')}] {n.get('text','')}")
+
+    def add():
+        txt = simpledialog.askstring("Заметка", "Текст:", parent=w)
+        if txt:
+            db = load()
+            db.append({"t": now_iso(), "text": txt})
+            save(db)
+            refresh()
+
+    def delete():
+        sel = lb.curselection()
+        if not sel:
+            return
+        db = load()
+        db.pop(sel[0])
+        save(db)
+        refresh()
+
+    bar = tk.Frame(w.body, bg=BG_WINDOW)
+    bar.pack(fill="x", pady=(8, 0))
+    tk.Button(bar, text="➕ Добавить", command=add).pack(side="left")
+    tk.Button(bar, text="🗑 Удалить", command=delete).pack(side="left", padx=6)
+    refresh()
+
+
+def open_about(desktop, *_) -> None:
+    w = AppWindow(desktop, "О системе", "ℹ", mem=6)
+    kernel = desktop.os
+    box = centered(w.body)
+    tk.Label(box, text="🐍", font=("Segoe UI", 64), bg=BG_WINDOW).pack(pady=10)
+    tk.Label(box, text=VERSION, font=("Segoe UI", 18, "bold"), bg=BG_WINDOW).pack()
+    tk.Label(box, bg=BG_WINDOW, justify="center", font=FONT,
+             text=f"Python {sys.version.split()[0]}\n"
+                  f"Платформа: {sys.platform}\n"
+                  f"Пользователь: {kernel.users.whoami()}\n"
+                  f"Процессов: {len(kernel.procs.procs)}").pack(pady=12)
+
+
+def open_processes(desktop, *_) -> None:
+    w = AppWindow(desktop, "Процессы", "📊", mem=9)
+    kernel = desktop.os
+    lb = tk.Listbox(w.body, font=("Consolas", 11), bd=0)
+    lb.pack(fill="both", expand=True)
+
+    def refresh():
+        lb.delete(0, "end")
+        lb.insert("end", f"{'PID':>5} {'USER':<8} {'NICE':>4} {'MEM':>5} STATE    NAME")
+        for p in kernel.procs.procs:
+            lb.insert("end", f"{p.pid:>5} {p.user:<8} {p.nice:>4} {p.mem:>4}M "
+                             f"{p.state:<8} {p.name}")
+
+    def kill():
+        sel = lb.curselection()
+        if not sel or sel[0] == 0:
+            return
+        pid = int(lb.get(sel[0]).split()[0])
+        if not kernel.users.is_admin():
+            p = kernel.procs.find(pid)
+            if p and p.user != kernel.users.current:
+                messagebox.showerror("kill", "нет прав", parent=w)
+                return
+        ok, msg = kernel.procs.kill(pid)
+        (messagebox.showinfo if ok else messagebox.showerror)("kill", msg, parent=w)
+        refresh()
+
+    bar = tk.Frame(w.body, bg=BG_WINDOW)
+    bar.pack(fill="x", pady=(8, 0))
+    tk.Button(bar, text="🔄 Обновить", command=refresh).pack(side="left")
+    tk.Button(bar, text="❌ Завершить", command=kill).pack(side="left", padx=6)
+    refresh()
+
+
+def open_monitor(desktop, *_) -> None:
+    w = AppWindow(desktop, "Монитор", "📈", mem=10)
+    kernel = desktop.os
+    canvas = tk.Canvas(w.body, bg="#0b1220", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    info = tk.Label(w.body, bg="#0b1220", fg="#7dd3fc",
+                    font=("Consolas", 11), justify="left", anchor="w")
+    info.pack(fill="x")
+    cpu_hist = [0.0] * 60
+    mem_hist = [0] * 60
+
+    def tick():
+        if w._closed:
+            return
+        try:
+            cpu = random.uniform(5, 60)
+            mem = kernel.procs.total_mem()
+            cpu_hist.pop(0)
+            cpu_hist.append(cpu)
+            mem_hist.pop(0)
+            mem_hist.append(mem)
+            canvas.delete("all")
+            W = canvas.winfo_width() or 600
+            H = canvas.winfo_height() or 260
+            canvas.create_text(8, 8, anchor="nw", fill="#7dd3fc",
+                               text=f"CPU {cpu:.1f}%   RAM {mem} MB   "
+                                    f"PROC {len(kernel.procs.procs)}",
+                               font=("Consolas", 11))
+            for i in range(1, len(cpu_hist)):
+                x1 = W * (i - 1) / len(cpu_hist)
+                x2 = W * i / len(cpu_hist)
+                y1 = H - (cpu_hist[i - 1] / 100) * (H - 30)
+                y2 = H - (cpu_hist[i] / 100) * (H - 30)
+                canvas.create_line(x1, y1, x2, y2, fill="#22c55e", width=2)
+                ym1 = H - (mem_hist[i - 1] / 512) * (H - 30)
+                ym2 = H - (mem_hist[i] / 512) * (H - 30)
+                canvas.create_line(x1, ym1, x2, ym2, fill="#3b82f6", width=2)
+            info.config(text=f"Процессов: {len(kernel.procs.procs)}   Память: {mem}/512 MB")
+        except tk.TclError:
+            return
+        w.after(500, tick)
+
+    tick()
+
+
+def open_computer(desktop, path="/", *_) -> None:
+    w = AppWindow(desktop, "Этот компьютер", "💻", mem=11)
+    kernel = desktop.os
+    path_var = tk.StringVar(value=path or "/")
+    tk.Entry(w.body, textvariable=path_var, font=("Consolas", 10)).pack(fill="x")
+    lb = tk.Listbox(w.body, font=("Consolas", 11), bd=0)
+    lb.pack(fill="both", expand=True, pady=6)
+
+    def refresh():
+        lb.delete(0, "end")
+        current = path_var.get().strip() or "/"
+        try:
+            node = kernel.vfs._get(kernel.vfs.resolve(current))
+            if node is None or node.kind != "dir":
+                raise VFSError("нет такой директории")
+            if current != "/":
+                lb.insert("end", "../")
+            for name in kernel.vfs.names(current, show_hidden=True):
+                lb.insert("end", name)
+        except VFSError as e:
+            lb.insert("end", str(e))
+
+    def open_selected(event=None):
+        sel = lb.curselection()
+        if not sel:
+            return
+        name = lb.get(sel[0]).rstrip("/@")
+        current = path_var.get().strip().rstrip("/")
+        target = "/" + "/".join(kernel.vfs.resolve(current + "/" + name))
+        if name == "..":
+            target = "/" + "/".join(kernel.vfs.resolve(current + "/.."))
+        node = kernel.vfs._get(kernel.vfs.resolve(target))
+        if node and node.kind == "dir":
+            path_var.set(target)
+            refresh()
+        elif node:
+            desktop.launch_from_os("edit", target)
+
+    tk.Button(w.body, text="🔄 Обновить", command=refresh).pack(side="bottom")
+    lb.bind("<Double-1>", open_selected)
+    path_var.trace_add("write", lambda *_: refresh())
+    refresh()
+
+
+def open_device_manager(desktop, *_) -> None:
+    w = AppWindow(desktop, "Диспетчер устройств", "🛠", mem=8)
+    kernel = desktop.os
+    lb = tk.Listbox(w.body, font=("Consolas", 11), bd=0)
+    lb.pack(fill="both", expand=True)
+
+    def refresh():
+        d = kernel.vfs.df()
+        rows = [
+            f"CPU     виртуальный процессор: {len(kernel.procs.procs)} процессов",
+            f"RAM     512 MB, занято {kernel.procs.total_mem()} MB",
+            f"Диск    VFS: {d['files']} файлов, {d['dirs']} каталогов, {human_size(d['bytes'])}",
+            f"Сеть    {len(kernel.net.hosts)} хостов, виртуальные сокеты",
+            "Дисплей tkinter virtual display",
+        ]
+        lb.delete(0, "end")
+        lb.insert("end", *rows)
+
+    tk.Button(w.body, text="🔄 Обновить", command=refresh).pack(side="bottom")
+    refresh()
+
+
+def open_settings(desktop, *_) -> None:
+    w = AppWindow(desktop, "Настройки", "⚙", mem=7)
+    kernel = desktop.os
+    box = centered(w.body)
+
+    tk.Label(box, text="Тема:", bg=BG_WINDOW, font=FONT_BOLD).grid(
+        row=0, column=0, sticky="w", pady=4)
+    theme_var = tk.StringVar(value=kernel.theme)
+    ttk.Combobox(box, textvariable=theme_var, values=("dark", "light"),
+                 state="readonly", width=12).grid(row=0, column=1, pady=4)
+
+    tk.Label(box, text="Обои:", bg=BG_WINDOW, font=FONT_BOLD).grid(
+        row=1, column=0, sticky="w", pady=4)
+    wall_var = tk.StringVar(value=kernel.wallpaper)
+    ttk.Combobox(box, textvariable=wall_var, values=tuple(WALLPAPERS.keys()),
+                 state="readonly", width=12).grid(row=1, column=1, pady=4)
+    tk.Label(box, text="Размер ярлыков:", bg=BG_WINDOW, font=FONT_BOLD).grid(
+        row=2, column=0, sticky="w", pady=4)
+    size_var = tk.IntVar(value=kernel.icon_size)
+    tk.Spinbox(box, from_=64, to=144, textvariable=size_var, width=10).grid(row=2, column=1)
+    scale_var = tk.DoubleVar(value=kernel.icon_scale)
+    tk.Label(box, text="Масштаб:", bg=BG_WINDOW, font=FONT_BOLD).grid(row=3, column=0, sticky="w", pady=4)
+    tk.Scale(box, from_=0.75, to=1.5, resolution=0.05, orient="horizontal",
+             variable=scale_var, bg=BG_WINDOW, highlightthickness=0).grid(row=3, column=1)
+    autosave_var = tk.BooleanVar(value=kernel.autosave_enabled)
+    tips_var = tk.BooleanVar(value=kernel.show_tooltips)
+    tk.Checkbutton(box, text="Автосохранение", variable=autosave_var,
+                   bg=BG_WINDOW).grid(row=4, column=0, columnspan=2, sticky="w")
+    tk.Checkbutton(box, text="Показывать подсказки", variable=tips_var,
+                   bg=BG_WINDOW).grid(row=5, column=0, columnspan=2, sticky="w")
+
+    def apply():
+        kernel.theme = theme_var.get()
+        kernel.wallpaper = wall_var.get()
+        kernel.icon_size = max(64, min(144, size_var.get()))
+        kernel.icon_scale = max(0.75, min(1.5, scale_var.get()))
+        kernel.autosave_enabled = autosave_var.get()
+        kernel.show_tooltips = tips_var.get()
+        desktop._apply_wallpaper()
+        desktop._last_layout_size = (0, 0)
+        desktop.place_icons()
+        kernel.save_state()
+        messagebox.showinfo("Настройки", "Применено", parent=w)
+
+    def reset_positions():
+        kernel.icon_positions.clear()
+        desktop._last_layout_size = (0, 0)
+        desktop.place_icons()
+        kernel.save_state()
+
+    tk.Button(box, text="Сбросить позиции", command=reset_positions).grid(
+        row=6, column=0, pady=8)
+    tk.Button(box, text="Применить", command=apply).grid(
+        row=6, column=1, pady=8)
+
+
+def open_market(desktop, *_) -> None:
+    w = AppWindow(desktop, "Магазин", "🛍", mem=8)
+    kernel = desktop.os
+    lb = tk.Listbox(w.body, font=("Consolas", 11), bd=0)
+    lb.pack(fill="both", expand=True)
+
+    def refresh():
+        lb.delete(0, "end")
+        for n, d in PackageManager.REGISTRY.items():
+            mark = "✓" if n in kernel.packages.installed else " "
+            lb.insert("end", f"[{mark}] {n:<12} {d['desc']}")
+
+    def get_name():
+        sel = lb.curselection()
+        if not sel:
+            return None
+        line = lb.get(sel[0])
+        return line.split("]")[1].strip().split()[0]
+
+    def install():
+        name = get_name()
+        if not name:
+            return
+        try:
+            kernel.packages.install(name)
+        except PyOSError as e:
+            messagebox.showerror("Магазин", str(e), parent=w)
+        refresh()
+
+    def remove():
+        name = get_name()
+        if not name:
+            return
+        try:
+            kernel.packages.remove(name)
+        except PyOSError as e:
+            messagebox.showerror("Магазин", str(e), parent=w)
+        refresh()
+
+    bar = tk.Frame(w.body, bg=BG_WINDOW)
+    bar.pack(fill="x", pady=(8, 0))
+    tk.Button(bar, text="📥 Установить", command=install).pack(side="left")
+    tk.Button(bar, text="🗑 Удалить", command=remove).pack(side="left", padx=6)
+    refresh()
+
+
+def open_editor(desktop, path: Optional[str] = None, *_) -> None:
+    w = AppWindow(desktop, "Редактор", "📝", mem=16)
+    kernel = desktop.os
+    top = tk.Frame(w.body, bg=BG_WINDOW)
+    top.pack(fill="x")
+    tk.Label(top, text="Файл:", bg=BG_WINDOW).pack(side="left")
+    name_entry = tk.Entry(top, width=40)
+    name_entry.pack(side="left", padx=6)
+    name_entry.insert(0, path or "newfile.txt")
+    status = tk.Label(w.body, text="", bg=BG_WINDOW, fg="#555555", anchor="w")
+    status.pack(side="bottom", fill="x")
+    txt = tk.Text(w.body, font=("Consolas", 12), bd=0, undo=True)
+    txt.pack(fill="both", expand=True, pady=8)
+
+    def load(silent=False):
+        name = name_entry.get().strip()
+        try:
+            content = kernel.vfs.read(name)
+        except (VFSError, PermError) as e:
+            if not silent:
+                messagebox.showerror("Ошибка", str(e), parent=w)
+            return
+        txt.delete("1.0", "end")
+        txt.insert("1.0", content)
+        status.config(text=f"Открыт: {name}")
+
+    def save():
+        name = name_entry.get().strip()
+        try:
+            kernel.vfs.write(name, txt.get("1.0", "end-1c"))
+            status.config(text=f"Сохранено: {name}")
+        except (VFSError, PermError) as e:
+            messagebox.showerror("Ошибка", str(e), parent=w)
+
+    tk.Button(top, text="📂 Открыть", command=load).pack(side="left")
+    tk.Button(top, text="💾 Сохранить", command=save).pack(side="left", padx=6)
+    if path:
+        load(silent=True)
+
+
+def open_files(desktop, *_) -> None:
+    """Двухпанельный проводник с копированием выбранного файла."""
+    w = AppWindow(desktop, "Файлы", "📁", mem=11)
+    kernel = desktop.os
+
+    panel = tk.Frame(w.body, bg=BG_WINDOW)
+    panel.pack(fill="both", expand=True)
+    panes: dict[str, tuple] = {}
+
+    def make_pane(parent, initial_parts, side):
+        cur = [list(initial_parts)]
+        frame = tk.Frame(parent, bg=BG_WINDOW)
+        frame.pack(side="left", fill="both", expand=True, padx=4)
+        path_var = tk.StringVar()
+        entry = tk.Entry(frame, textvariable=path_var, font=("Consolas", 10))
+        entry.pack(fill="x")
+        lb = tk.Listbox(frame, font=("Consolas", 11), bd=0)
+        lb.pack(fill="both", expand=True)
+
+        def here():
+            return "/" + "/".join(cur[0]) if cur[0] else "/"
+
+        def refresh():
+            path_var.set(here())
+            lb.delete(0, "end")
+            try:
+                for name in kernel.vfs.names(here(), show_hidden=True):
+                    lb.insert("end", name)
+            except VFSError:
+                pass
+
+        def go(event):
+            parts = kernel.vfs.resolve(path_var.get().strip())
+            node = kernel.vfs._get(parts)
+            if node and node.kind == "dir":
+                cur[0] = parts
+                refresh()
+
+        def open_sel(event=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            name = lb.get(sel[0]).rstrip("/@")
+            target = here().rstrip("/") + "/" + name
+            node = kernel.vfs._get(kernel.vfs.resolve(target))
+            if node and node.kind == "dir":
+                cur[0] = kernel.vfs.resolve(target)
+                refresh()
+            else:
+                desktop.launch_from_os("edit", target)
+
+        entry.bind("<Return>", go)
+        lb.bind("<Double-1>", open_sel)
+        refresh()
+        panes[side] = {"refresh": refresh, "lb": lb, "cur": cur}
+
+    make_pane(panel, kernel.vfs.cwd, "left")
+    make_pane(panel, kernel.vfs.cwd, "right")
+
+    def copy_selected(src_side, dst_side):
+        src = panes[src_side]
+        dst = panes[dst_side]
+        sel = src["lb"].curselection()
+        if not sel:
+            return
+        name = src["lb"].get(sel[0]).rstrip("/@")
+        src_path = ("/" + "/".join(src["cur"][0])).rstrip("/") + "/" + name
+        dst_path = ("/" + "/".join(dst["cur"][0])).rstrip("/") + "/" + name
+        try:
+            node = kernel.vfs._get(kernel.vfs.resolve(src_path))
+            if node and node.kind == "dir":
+                messagebox.showinfo("Файлы", "Копирование папок не поддерживается",
+                                    parent=w)
+                return
+            data = kernel.vfs.read(src_path)
+            kernel.vfs.write(dst_path, data)
+        except (VFSError, PermError) as e:
+            messagebox.showerror("Файлы", str(e), parent=w)
+            return
+        panes["left"]["refresh"]()
+        panes["right"]["refresh"]()
+
+    bar = tk.Frame(w.body, bg=BG_WINDOW)
+    bar.pack(fill="x")
+    tk.Button(bar, text="🔄 Обновить",
+              command=lambda: (panes["left"]["refresh"](),
+                               panes["right"]["refresh"]())).pack(side="left")
+    tk.Button(bar, text="← Копировать",
+              command=lambda: copy_selected("left", "right")).pack(side="left", padx=4)
+    tk.Button(bar, text="→ Копировать",
+              command=lambda: copy_selected("right", "left")).pack(side="left")
+
+
+def open_game(desktop, *_) -> None:
+    w = AppWindow(desktop, "Угадай число", "🎮", mem=7)
+    box = centered(w.body)
+    st = {"secret": random.randint(1, 100), "tries": 0, "done": False}
+    tk.Label(box, text="Число от 1 до 100", bg=BG_WINDOW,
+             font=("Segoe UI", 14)).pack(pady=10)
+    info = tk.Label(box, text="Попробуй!", bg=BG_WINDOW, fg=ACCENT,
+                    font=("Segoe UI", 13, "bold"))
+    info.pack(pady=8)
+    entry = tk.Entry(box, font=("Segoe UI", 16), justify="center")
+    entry.pack(pady=8)
+
+    def check(event=None):
+        if st["done"]:
+            return
+        try:
+            n = int(entry.get())
+        except ValueError:
+            info.config(text="Введи число!", fg="#ef4444")
+            return
+        st["tries"] += 1
+        entry.delete(0, "end")
+        if n < st["secret"]:
+            info.config(text=f"⬆ Больше ({st['tries']})", fg=ACCENT)
+        elif n > st["secret"]:
+            info.config(text=f"⬇ Меньше ({st['tries']})", fg=ACCENT)
+        else:
+            st["done"] = True
+            info.config(text=f"🎉 Угадал за {st['tries']}!", fg="#22c55e")
+
+    def new_game():
+        st["secret"] = random.randint(1, 100)
+        st["tries"] = 0
+        st["done"] = False
+        info.config(text="Попробуй!", fg=ACCENT)
+        entry.delete(0, "end")
+
+    tk.Button(box, text="Новая игра", command=new_game).pack(pady=6)
+    entry.bind("<Return>", check)
+    w.after(120, entry.focus_set)
+
+
+def open_tictactoe(desktop, *_) -> None:
+    w = AppWindow(desktop, "Крестики-нолики", "❌", mem=7)
+    box = centered(w.body)
+    state = {"board": [" "] * 9}
+    LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6),
+             (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+    status = tk.Label(box, text="Ваш ход", bg=BG_WINDOW, fg=ACCENT,
+                      font=("Segoe UI", 14, "bold"))
+    status.pack(pady=(0, 10))
+    grid = tk.Frame(box, bg=BG_WINDOW)
+    grid.pack()
+    btns = []
+
+    def winner(b):
+        for a, c, d in LINES:
+            if b[a] != " " and b[a] == b[c] == b[d]:
+                return b[a]
+        return None
+
+    def update():
+        b = state["board"]
+        for i, btn in enumerate(btns):
+            btn.config(text=b[i],
+                       state="disabled" if b[i] != " " or winner(b) else "normal")
+        wn = winner(b)
+        if wn == "X":
+            status.config(text="🎉 Победа!", fg="#22c55e")
+        elif wn == "O":
+            status.config(text="Компьютер победил", fg="#ef4444")
+        elif " " not in b:
+            status.config(text="Ничья", fg="#888")
+
+    def click(i):
+        b = state["board"]
+        if b[i] != " " or winner(b):
+            return
+        b[i] = "X"
+        if " " in b and not winner(b):
+            free = [j for j, v in enumerate(b) if v == " "]
+            b[random.choice(free)] = "O"
+        update()
+
+    def new_game():
+        state["board"] = [" "] * 9
+        update()
+
+    for i in range(9):
+        btn = tk.Button(grid, text=" ", width=3,
+                        font=("Segoe UI", 30, "bold"),
+                        command=lambda i=i: click(i))
+        btn.grid(row=i // 3, column=i % 3, padx=3, pady=3)
+        btns.append(btn)
+    tk.Button(box, text="Новая игра", command=new_game).pack(pady=10)
+    update()
+
+
+def open_hangman(desktop, *_) -> None:
+    w = AppWindow(desktop, "Виселица", "🔤", mem=8)
+    box = centered(w.body)
+    words = ["питон", "компьютер", "терминал", "память", "ядро", "сервер", "файл"]
+    state = {"word": random.choice(words), "right": set(), "wrong": set()}
+    art = tk.Label(box, bg=BG_WINDOW, font=("Consolas", 14), justify="left")
+    art.pack()
+    word_lbl = tk.Label(box, bg=BG_WINDOW, font=("Consolas", 22, "bold"))
+    word_lbl.pack(pady=6)
+    status = tk.Label(box, bg=BG_WINDOW, font=FONT)
+    status.pack()
+    keys = tk.Frame(box, bg=BG_WINDOW)
+    keys.pack(pady=8)
+    buttons = {}
+
+    def update():
+        word = state["word"]
+        masked = " ".join(c if c in state["right"] else "_" for c in word)
+        word_lbl.config(text=masked if len(state["wrong"]) < 6 else " ".join(word))
+        art.config(text=f"Ошибки: {len(state['wrong'])}/6\n"
+                        f"{' '.join(sorted(state['wrong']))}")
+        won = all(c in state["right"] for c in word)
+        lost = len(state["wrong"]) >= 6
+        for ch, btn in buttons.items():
+            btn.config(state="disabled"
+                        if won or lost or ch in state["right"] or ch in state["wrong"]
+                        else "normal")
+        status.config(text="🎉 Победа!" if won
+                      else ("💀 Проигрыш" if lost else "Играем"))
+
+    def pick(ch):
+        state["right" if ch in state["word"] else "wrong"].add(ch)
+        update()
+
+    def new_game():
+        state["word"] = random.choice(words)
+        state["right"] = set()
+        state["wrong"] = set()
+        update()
+
+    alpha = "абвгдежзийклмнопрстуфхцчшщъыьэюя"
+    for i, ch in enumerate(alpha):
+        btn = tk.Button(keys, text=ch.upper(), width=3, font=FONT_BOLD,
+                        command=lambda ch=ch: pick(ch))
+        btn.grid(row=i // 8, column=i % 8, padx=1, pady=1)
+        buttons[ch] = btn
+    tk.Button(box, text="Новая игра", command=new_game).pack(pady=6)
+    update()
+
+
+def open_2048(desktop, *_) -> None:
+    w = AppWindow(desktop, "2048", "🔢", mem=8)
+    box = centered(w.body)
+    grid = tk.Frame(box, bg=BG_WINDOW)
+    grid.pack()
+    state = {"board": [[0] * 4 for _ in range(4)], "score": 0}
+    labels = [[None] * 4 for _ in range(4)]
+    score_lbl = tk.Label(box, text="Счёт: 0", bg=BG_WINDOW,
+                         font=("Segoe UI", 14, "bold"))
+    score_lbl.pack(pady=6)
+
+    COLORS = {0: "#ccc", 2: "#eee4da", 4: "#ede0c8", 8: "#f2b179",
+              16: "#f59563", 32: "#f67c5f", 64: "#f65e3b",
+              128: "#edcf72", 256: "#edcc61", 512: "#edc850",
+              1024: "#edc53f", 2048: "#edc22e"}
+
+    def new_tile():
+        empties = [(i, j) for i in range(4) for j in range(4)
+                   if state["board"][i][j] == 0]
+        if empties:
+            i, j = random.choice(empties)
+            state["board"][i][j] = random.choice([2, 2, 4])
+
+    def draw():
+        for i in range(4):
+            for j in range(4):
+                v = state["board"][i][j]
+                labels[i][j].config(text=str(v) if v else "",
+                                    bg=COLORS.get(v, "#3c3a32"),
+                                    fg="#776e65" if v < 8 else "white")
+        score_lbl.config(text=f"Счёт: {state['score']}")
+
+    def compress(row):
+        nz = [x for x in row if x]
+        out = []
+        i = 0
+        while i < len(nz):
+            if i + 1 < len(nz) and nz[i] == nz[i + 1]:
+                out.append(nz[i] * 2)
+                state["score"] += nz[i] * 2
+                i += 2
+            else:
+                out.append(nz[i])
+                i += 1
+        return out + [0] * (4 - len(out))
+
+    def move(direction):
+        b = state["board"]
+        if direction in ("left", "right"):
+            for i in range(4):
+                row = b[i] if direction == "left" else b[i][::-1]
+                row = compress(row)
+                b[i] = row if direction == "left" else row[::-1]
+        else:
+            for j in range(4):
+                col = [b[i][j] for i in range(4)]
+                if direction == "down":
+                    col = col[::-1]
+                col = compress(col)
+                if direction == "down":
+                    col = col[::-1]
+                for i in range(4):
+                    b[i][j] = col[i]
+        new_tile()
+        draw()
+
+    def key(event):
+        m = {"Up": "up", "Down": "down", "Left": "left", "Right": "right"}
+        if event.keysym in m:
+            move(m[event.keysym])
+
+    for i in range(4):
+        for j in range(4):
+            lbl = tk.Label(grid, text="", width=4, height=2,
+                           font=("Segoe UI", 20, "bold"), bg="#ccc")
+            lbl.grid(row=i, column=j, padx=2, pady=2)
+            labels[i][j] = lbl
+    new_tile()
+    new_tile()
+    draw()
+    w.bind("<Key>", key)
+    w.after(120, lambda: w.focus_force())
+
+
+def open_snake(desktop, *_) -> None:
+    w = AppWindow(desktop, "Змейка", "🐍", mem=7)
+    canvas = tk.Canvas(w.body, bg="#0b1220", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    state = {"snake": [(10, 10)], "dir": (1, 0), "food": (15, 15),
+             "alive": True, "score": 0}
+    CELL = 18
+
+    def draw():
+        canvas.delete("all")
+        for (x, y) in state["snake"]:
+            canvas.create_rectangle(x * CELL, y * CELL,
+                                    (x + 1) * CELL, (y + 1) * CELL,
+                                    fill="#22c55e", outline="")
+        fx, fy = state["food"]
+        canvas.create_rectangle(fx * CELL, fy * CELL,
+                                (fx + 1) * CELL, (fy + 1) * CELL,
+                                fill="#ef4444", outline="")
+        canvas.create_text(10, 10, anchor="nw", fill="#7dd3fc",
+                           text=f"Счёт: {state['score']}",
+                           font=("Consolas", 12))
+
+    def tick():
+        if not state["alive"] or w._closed:
+            return
+        try:
+            dx, dy = state["dir"]
+            x, y = state["snake"][-1]
+            nx, ny = x + dx, y + dy
+            if (nx, ny) in state["snake"] or nx < 0 or ny < 0:
+                state["alive"] = False
+                draw()
+                canvas.create_text(canvas.winfo_width() / 2,
+                                   canvas.winfo_height() / 2,
+                                   text="Игра окончена", fill="#ef4444",
+                                   font=("Segoe UI", 24, "bold"))
+                return
+            state["snake"].append((nx, ny))
+            if (nx, ny) == state["food"]:
+                state["score"] += 1
+                state["food"] = (random.randint(1, 18), random.randint(1, 18))
+            else:
+                state["snake"].pop(0)
+            draw()
+        except tk.TclError:
+            return
+        w.after(150, tick)
+
+    def key(event):
+        m = {"Up": (0, -1), "Down": (0, 1), "Left": (-1, 0), "Right": (1, 0)}
+        if event.keysym in m:
+            state["dir"] = m[event.keysym]
+
+    w.bind("<Key>", key)
+    w.after(120, lambda: (w.focus_force(), tick()))
+
+
+def open_tetris(desktop, *_) -> None:
+    w = AppWindow(desktop, "Тетрис", "🧱", mem=8)
+    canvas = tk.Canvas(w.body, bg="#0b1220", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    CELL = 22
+    COLS, ROWS = 10, 18
+    SHAPES = [
+        ["....", "XXXX", "....", "...."],
+        ["X..", "XXX", "..."],
+        ["XX.", ".XX", "..."],
+        ["XXX", "X..", "X.."],
+        ["XX", "XX"],
+        ["XXX", "X.X"],
+        ["X..", "XXX", "..."],
+    ]
+    state = {"board": [[0] * COLS for _ in range(ROWS)], "score": 0,
+             "over": False, "cur": None, "x": 3, "y": 0}
+
+    def collision(shape, px, py):
+        for i, row in enumerate(shape):
+            for j, ch in enumerate(row):
+                if ch != "X":
+                    continue
+                x, y = px + j, py + i
+                if x < 0 or x >= COLS or y >= ROWS:
+                    return True
+                if y >= 0 and state["board"][y][x]:
+                    return True
+        return False
+
+    def new_piece():
+        shape = random.choice(SHAPES)
+        state["cur"] = shape
+        state["x"] = COLS // 2 - len(shape[0]) // 2
+        state["y"] = 0
+        if collision(shape, state["x"], state["y"]):
+            state["over"] = True
+
+    def lock():
+        shape = state["cur"]
+        for i, row in enumerate(shape):
+            for j, ch in enumerate(row):
+                if ch == "X":
+                    x, y = state["x"] + j, state["y"] + i
+                    if 0 <= y < ROWS:
+                        state["board"][y][x] = 1
+        for i in range(ROWS - 1, -1, -1):
+            if all(state["board"][i]):
+                del state["board"][i]
+                state["board"].insert(0, [0] * COLS)
+                state["score"] += 10
+        new_piece()
+
+    def draw():
+        canvas.delete("all")
+        for i in range(ROWS):
+            for j in range(COLS):
+                if state["board"][i][j]:
+                    canvas.create_rectangle(j * CELL, i * CELL,
+                                            (j + 1) * CELL, (i + 1) * CELL,
+                                            fill="#3b82f6", outline="")
+        if state["cur"]:
+            for i, row in enumerate(state["cur"]):
+                for j, ch in enumerate(row):
+                    if ch == "X":
+                        x, y = state["x"] + j, state["y"] + i
+                        canvas.create_rectangle(x * CELL, y * CELL,
+                                                (x + 1) * CELL, (y + 1) * CELL,
+                                                fill="#f59e0b", outline="")
+        canvas.create_text(10, 10, anchor="nw", fill="#7dd3fc",
+                           text=f"Счёт: {state['score']}",
+                           font=("Consolas", 12))
+        if state["over"]:
+            canvas.create_text(canvas.winfo_width() / 2,
+                               canvas.winfo_height() / 2,
+                               text="Игра окончена", fill="#ef4444",
+                               font=("Segoe UI", 24, "bold"))
+
+    def tick():
+        if state["over"] or w._closed:
+            return
+        try:
+            if not collision(state["cur"], state["x"], state["y"] + 1):
+                state["y"] += 1
+            else:
+                lock()
+            draw()
+        except tk.TclError:
+            return
+        w.after(500, tick)
+
+    def key(event):
+        if state["over"] or not state["cur"]:
+            return
+        if event.keysym == "Left" and not collision(state["cur"], state["x"] - 1, state["y"]):
+            state["x"] -= 1
+        elif event.keysym == "Right" and not collision(state["cur"], state["x"] + 1, state["y"]):
+            state["x"] += 1
+        elif event.keysym == "Down" and not collision(state["cur"], state["x"], state["y"] + 1):
+            state["y"] += 1
+        elif event.keysym == "space":
+            while not collision(state["cur"], state["x"], state["y"] + 1):
+                state["y"] += 1
+        draw()
+
+    new_piece()
+    w.bind("<Key>", key)
+    w.after(120, lambda: (w.focus_force(), tick()))
+
+
+def open_minesweeper(desktop, *_) -> None:
+    w = AppWindow(desktop, "Сапёр", "💣", mem=7)
+    size = 9
+    bombs = 10
+    box = centered(w.body)
+    grid = tk.Frame(box, bg=BG_WINDOW)
+    grid.pack()
+    board = [[0] * size for _ in range(size)]
+    revealed = [[False] * size for _ in range(size)]
+    flags = [[False] * size for _ in range(size)]
+    btns = [[None] * size for _ in range(size)]
+    for _ in range(bombs):
+        i, j = random.randint(0, size - 1), random.randint(0, size - 1)
+        board[i][j] = -1
+    for i in range(size):
+        for j in range(size):
+            if board[i][j] == -1:
+                continue
+            cnt = sum(1 for di in (-1, 0, 1) for dj in (-1, 0, 1)
+                      if 0 <= i + di < size and 0 <= j + dj < size
+                      and board[i + di][j + dj] == -1)
+            board[i][j] = cnt
+
+    def reveal(i, j):
+        if revealed[i][j] or flags[i][j]:
+            return
+        revealed[i][j] = True
+        btns[i][j].config(state="disabled", relief="sunken")
+        if board[i][j] == -1:
+            btns[i][j].config(text="💣", bg="#ef4444")
+            return
+        if board[i][j] == 0:
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    if 0 <= i + di < size and 0 <= j + dj < size:
+                        reveal(i + di, j + dj)
+        else:
+            btns[i][j].config(text=str(board[i][j]))
+
+    def flag(event, i, j):
+        if revealed[i][j]:
+            return
+        flags[i][j] = not flags[i][j]
+        btns[i][j].config(text="🚩" if flags[i][j] else "")
+
+    for i in range(size):
+        for j in range(size):
+            btn = tk.Button(grid, width=2, font=("Segoe UI", 12, "bold"))
+            btn.grid(row=i, column=j)
+            btn.bind("<Button-1>", lambda e, i=i, j=j: reveal(i, j))
+            btn.bind("<Button-3>", lambda e, i=i, j=j: flag(e, i, j))
+            btns[i][j] = btn
+
+
+def open_paint(desktop, *_) -> None:
+    w = AppWindow(desktop, "Paint", "🎨", mem=12)
+    canvas = tk.Canvas(w.body, bg="white", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    color = ["black"]
+    last = [None]
+
+    def start(event):
+        last[0] = (event.x, event.y)
+
+    def draw(event):
+        if last[0]:
+            canvas.create_line(last[0][0], last[0][1], event.x, event.y,
+                               fill=color[0], width=3, capstyle="round")
+            last[0] = (event.x, event.y)
+
+    def stop(event):
+        last[0] = None
+
+    canvas.bind("<Button-1>", start)
+    canvas.bind("<B1-Motion>", draw)
+    canvas.bind("<ButtonRelease-1>", stop)
+
+    bar = tk.Frame(w.body, bg=BG_WINDOW)
+    bar.pack(fill="x")
+    for c in ("black", "red", "green", "blue", "orange"):
+        tk.Button(bar, bg=c, width=3,
+                  command=lambda c=c: color.__setitem__(0, c)).pack(side="left", padx=2)
+    tk.Button(bar, text="Очистить",
+              command=lambda: canvas.delete("all")).pack(side="left", padx=6)
+
+
+def open_browser(desktop, *_) -> None:
+    w = AppWindow(desktop, "Браузер", "🌐", mem=8)
+    bar = tk.Frame(w.body, bg=BG_WINDOW)
+    bar.pack(fill="x")
+    url = tk.Entry(bar, font=FONT)
+    url.pack(side="left", fill="x", expand=True)
+    url.insert(0, "http://localhost/")
+    text = tk.Text(w.body, font=("Consolas", 11), bd=0)
+    text.pack(fill="both", expand=True, pady=6)
+
+    def go():
+        u = url.get().strip()
+        if not re.match(r"https?://", u):
+            u = "http://" + u
+        try:
+            text.delete("1.0", "end")
+            text.insert("1.0", desktop.os.net.fetch(u))
+            if "/" not in u.split("//", 1)[1] or u.endswith("/"):
+                text.insert("end", "\n\n" + desktop.os.vfs.read("/public/index.html"))
+        except (PyOSError, VFSError) as e:
+            text.delete("1.0", "end")
+            text.insert("1.0", f"Ошибка: {e}")
+
+    url.bind("<Return>", lambda e: go())
+    tk.Button(bar, text="→", command=go).pack(side="left", padx=4)
+    go()
+
+
+def open_calendar(desktop, *_) -> None:
+    w = AppWindow(desktop, "Календарь", "📅", mem=7)
+    now = datetime.datetime.now()
+    box = centered(w.body)
+    tk.Label(box, text=now.strftime("%B %Y"), bg=BG_WINDOW,
+             font=("Segoe UI", 18, "bold")).pack(pady=6)
+    for d in range(1, 32):
+        try:
+            dt = now.replace(day=d)
+        except ValueError:
+            break
+        tk.Label(box, text=f"{d:>3}  {dt.strftime('%a')}",
+                 bg=BG_WINDOW, font=FONT).pack(anchor="w")
+
+
+def open_mail(desktop, *_) -> None:
+    w = AppWindow(desktop, "Почта", "✉", mem=7)
+    box = centered(w.body)
+    tk.Label(box, text="Входящие", bg=BG_WINDOW, font=FONT_BOLD).pack(pady=6)
+    for sender, subj in (("root", "Добро пожаловать в PyOS 3.0"),
+                         ("noreply", "Обновление доступно"),
+                         ("user", "Re: заметки")):
+        tk.Label(box, text=f"{sender}: {subj}", bg=BG_WINDOW,
+                 font=FONT).pack(anchor="w", padx=10)
+
+
+def open_media(desktop, *_) -> None:
+    w = AppWindow(desktop, "Медиаплеер", "🎵", mem=8)
+    canvas = tk.Canvas(w.body, bg="#0b1220", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    tracks = ["track1.mp3", "track2.mp3", "track3.mp3"]
+    cur = [0]
+    info = tk.Label(w.body, text="", bg="#0b1220", fg="#7dd3fc", font=FONT)
+    info.pack(fill="x")
+
+    def draw_bars():
+        if w._closed:
+            return
+        try:
+            canvas.delete("all")
+            W = canvas.winfo_width() or 500
+            H = canvas.winfo_height() or 250
+            for i in range(40):
+                x = W * i / 40
+                h = random.randint(10, H - 20)
+                canvas.create_rectangle(x, H - h, x + W / 60, H,
+                                        fill="#22c55e", outline="")
+            info.config(text=f"Играет: {tracks[cur[0]]}")
+        except tk.TclError:
+            return
+        w.after(300, draw_bars)
+
+    def next_track():
+        cur[0] = (cur[0] + 1) % len(tracks)
+        info.config(text=f"Играет: {tracks[cur[0]]}")
+
+    tk.Button(w.body, text="⏭ Следующий", command=next_track).pack(pady=6)
+    draw_bars()
+
+
+APPS = {
+    "terminal": ("Терминал", "🖥", open_terminal),
+    "files": ("Файлы", "📁", open_files),
+    "computer": ("Этот компьютер", "💻", open_computer),
+    "device_manager": ("Диспетчер устройств", "🛠", open_device_manager),
+    "edit": ("Редактор", "📝", open_editor),
+    "calc": ("Калькулятор", "🧮", open_calc),
+    "notes": ("Заметки", "🗒", open_notes),
+    "procs": ("Процессы", "📊", open_processes),
+    "monitor": ("Монитор", "📈", open_monitor),
+    "market": ("Магазин", "🛍", open_market),
+    "settings": ("Настройки", "⚙", open_settings),
+    "paint": ("Paint", "🎨", open_paint),
+    "browser": ("Браузер", "🌐", open_browser),
+    "calendar": ("Календарь", "📅", open_calendar),
+    "mail": ("Почта", "✉", open_mail),
+    "media": ("Медиаплеер", "🎵", open_media),
+    "guess": ("Угадай число", "🎮", open_game),
+    "tictactoe": ("Крестики-нолики", "❌", open_tictactoe),
+    "hangman": ("Виселица", "🔤", open_hangman),
+    "2048": ("2048", "🔢", open_2048),
+    "snake": ("Змейка", "🐍", open_snake),
+    "tetris": ("Тетрис", "🧱", open_tetris),
+    "minesweeper": ("Сапёр", "💣", open_minesweeper),
+    "about": ("О системе", "ℹ", open_about),
+}
+
+
+# ============================================================
+#                    РАБОЧИЙ СТОЛ
+# ============================================================
+class Desktop:
+    """Рабочий стол с ярлыками, панелью задач, меню Пуск, треем."""
+
+    def __init__(self, root, kernel: Kernel) -> None:
+        self.root = root
+        self.os = kernel
+        self.windows: list = []
+        self.taskbar_buttons: dict = {}
+        self._toasts: list = []
+        self.icons: list = []
+        self.start_menu = None
+        self._relayout_job = None
+        self._last_layout_size = (0, 0)
+
+        kernel.launcher = self.launch_from_os
+        kernel.procs.on_kill = self._on_proc_killed
+        kernel.desktop_notify = self.notify
+
+        root.title(VERSION)
+        root.configure(bg=BG_DESKTOP)
+        if "--window" in sys.argv:
+            root.geometry("1280x800")
+        else:
+            root.attributes("-fullscreen", True)
+            root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
+            root.bind("<F11>", lambda e: root.attributes(
+                "-fullscreen", not root.attributes("-fullscreen")))
+
+        self.taskbar = tk.Frame(root, bg=BG_TASKBAR, height=TASKBAR_H)
+        self.taskbar.pack(fill="x", side="bottom")
+        self.taskbar.pack_propagate(False)
+        self.canvas = tk.Canvas(root, bg=BG_DESKTOP, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Button-3>", self.context_menu)
+        self._apply_wallpaper()
+
+        tk.Button(self.taskbar, text="🐍 Пуск", bg=ACCENT, fg="white", font=FONT_BOLD,
+                  bd=0, padx=14, activebackground=ACCENT_DARK, activeforeground="white",
+                  command=self.toggle_start_menu
+                  ).pack(side="left", padx=6, pady=6, fill="y")
+        self.tray = tk.Label(self.taskbar, bg=BG_TASKBAR, fg=FG_TASKBAR,
+                             font=FONT, text="🔊  🌐  🔋")
+        self.tray.pack(side="right", padx=12)
+        self.clock = tk.Label(self.taskbar, bg=BG_TASKBAR, fg=FG_TASKBAR, font=FONT_BOLD)
+        self.clock.pack(side="right", padx=12)
+        center = tk.Frame(self.taskbar, bg=BG_TASKBAR)
+        center.pack(side="left", fill="both", expand=True)
+        self.task_frame = tk.Frame(center, bg=BG_TASKBAR)
+        self.task_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.canvas.bind("<Configure>", self._schedule_layout)
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(self.taskbar, textvariable=self.search_var,
+                                     bg="#1e2126", fg="white", insertbackground="white",
+                                     font=FONT, bd=0, width=22)
+        self.search_entry.pack(side="left", padx=(4, 8), pady=8, ipady=2)
+        self.search_entry.bind("<Return>", lambda e: self.toggle_start_menu(self.search_var.get()))
+        tk.Button(self.taskbar, text="🔎", bg=BG_TASKBAR, fg=FG_TASKBAR, bd=0,
+                  command=lambda: self.toggle_start_menu(self.search_var.get())).pack(side="left")
+        self.tick()
+        self._register_hotkeys()
+
+    def _register_hotkeys(self) -> None:
+        self.root.bind_all("<Super_L>", lambda e: self.toggle_start_menu())
+        self.root.bind_all("<Control-Alt-l>", lambda e: self.lock_screen())
+        self.root.bind_all("<Control-Alt-d>", lambda e: self.show_desktop())
+
+    def show_desktop(self) -> None:
+        for win in list(self.windows):
+            try:
+                win.withdraw()
+            except tk.TclError:
+                pass
+
+    def lock_screen(self) -> None:
+        LockScreen(self.root, self.os)
+
+    def _on_proc_killed(self, pid: int) -> None:
+        if pid == 42:
+            self.os.save_state()
+            self.root.after(50, self.root.destroy)
+            return
+        for win in list(self.windows):
+            if getattr(win, "pid", None) == pid:
+                win.close()
+
+    def launch_from_os(self, key: str, *args) -> bool:
+        entry = APPS.get(key)
+        if not entry:
+            return False
+        if key == "edit" and args:
+            args = ("/" + "/".join(self.os.vfs.resolve(args[0])),)
+        self.root.after(10, lambda: entry[2](self, *args))
+        return True
+
+    def _schedule_layout(self, event=None) -> None:
+        if self._relayout_job:
+            self.root.after_cancel(self._relayout_job)
+        self._relayout_job = self.root.after(60, self.place_icons)
+
+    def place_icons(self) -> None:
+        self._relayout_job = None
+        H, W = self.canvas.winfo_height(), self.canvas.winfo_width()
+        if H < 150 or (W, H) == self._last_layout_size:
+            return
+        self._last_layout_size = (W, H)
+        for ic in self.icons:
+            ic.frame.destroy()
+        self.icons.clear()
+        self.canvas.delete("all")
+        x, y = 30, 30
+        for key, (title, icon, opener) in APPS.items():
+            if key in self.os.icon_positions:
+                px, py = self._clamp_icon(*self.os.icon_positions[key], W, H)
+            else:
+                px, py = float(x), float(y)
+            self.icons.append(DesktopIcon(self.canvas, title, icon,
+                                          lambda o=opener: o(self), px, py,
+                                          lambda xx, yy, k=key: self._save_icon(k, xx, yy),
+                                          self.os.icon_size, self.os.icon_scale))
+            y += 110
+            if y + 96 > H - 30:
+                y = 30
+                x += 110
+        self.canvas.create_text(W - 20, H - 14, anchor="se", fill="#5b6f88",
+                                font=FONT,
+                                text="Super — Пуск  •  Ctrl+Alt+L — Lock  •  F11 — fullscreen")
+
+    @staticmethod
+    def _clamp_icon(x, y, W, H):
+        size = 96
+        grid = size + 14
+        usable_h = max(0, H - TASKBAR_H)
+        x = round(max(0, min(float(x), max(0, W - size))) / grid) * grid
+        y = round(max(0, min(float(y), max(0, usable_h - size))) / grid) * grid
+        return (max(0, min(x, max(0, W - size))),
+                max(0, min(y, max(0, usable_h - size))))
+
+    def _save_icon(self, key, x, y):
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        x, y = self._clamp_icon(x, y, W, H)
+        self.os.icon_positions[key] = [int(x), int(y)]
+        self.os.save_state()
+
+    def context_menu(self, event=None):
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="Открыть терминал",
+                         command=lambda: open_terminal(self))
+        menu.add_command(label="Настройки",
+                         command=lambda: open_settings(self))
+        menu.add_command(label="Сменить обои", command=self._next_wallpaper)
+        menu.add_separator()
+        menu.add_command(label="Заблокировать", command=self.lock_screen)
+        menu.add_command(label="Выключить", command=self.shutdown)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _apply_wallpaper(self) -> None:
+        color = WALLPAPERS.get(self.os.wallpaper, WALLPAPERS["nebula"])
+        self.root.configure(bg=color)
+        self.canvas.configure(bg=color)
+
+    def _next_wallpaper(self):
+        names = list(WALLPAPERS)
+        idx = names.index(self.os.wallpaper) if self.os.wallpaper in names else 0
+        self.os.wallpaper = names[(idx + 1) % len(names)]
+        self._apply_wallpaper()
+        self.os.save_state()
+
+    @staticmethod
+    def _tint(btn, bg: str, fg: str) -> None:
+        try:
+            btn.config(bg=bg, fg=fg)
+        except tk.TclError:
+            pass
+
+    def register_window(self, win) -> None:
+        self.windows.append(win)
+        btn = tk.Button(self.task_frame, text=f"  {win.title()}  ", bg=TASK_IDLE,
+                        fg=FG_TASKBAR, bd=0, font=FONT, activebackground=ACCENT,
+                        activeforeground="white",
+                        command=lambda w=win: self.focus_window(w))
+        btn.pack(side="left", padx=3, pady=6, fill="y")
+        self.taskbar_buttons[win] = btn
+        win.bind("<Unmap>", lambda e: self._tint(btn, TASK_MIN, FG_TASKBAR))
+        win.bind("<Map>", lambda e: self._tint(btn, TASK_IDLE, FG_TASKBAR))
+        win.bind("<FocusIn>", lambda e: self._tint(btn, ACCENT, "white"))
+        win.bind("<FocusOut>", lambda e: self._tint(btn, TASK_IDLE, FG_TASKBAR))
+        self._tint(btn, ACCENT, "white")
+
+    def unregister_window(self, win) -> None:
+        if win in self.windows:
+            self.windows.remove(win)
+        btn = self.taskbar_buttons.pop(win, None)
+        if btn:
+            btn.destroy()
+
+    def focus_window(self, win) -> None:
+        try:
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+        except tk.TclError:
+            pass
+
+    def close_start_menu(self) -> None:
+        if self.start_menu is not None:
+            try:
+                self.start_menu.destroy()
+            except tk.TclError:
+                pass
+            self.start_menu = None
+
+    def toggle_start_menu(self, query="") -> None:
+        if self.start_menu is not None:
+            if query and hasattr(self, "start_search_var"):
+                self.start_search_var.set(query)
+            elif not query:
+                self.close_start_menu()
+            return
+        if query is None:
+            query = ""
+            self.close_start_menu()
+            return
+        m = tk.Toplevel(self.root)
+        m.overrideredirect(True)
+        m.configure(bg=BG_DESKTOP)
+        try:
+            m.attributes("-transparentcolor", BG_DESKTOP)
+        except tk.TclError:
+            pass
+        W, H = 640, 580
+        x = self.root.winfo_rootx() + self.root.winfo_width() // 2 - W // 2
+        y = self.root.winfo_rooty() + self.root.winfo_height() - TASKBAR_H - H - 10
+        m.geometry(f"{W}x{H}+{x}+{max(self.root.winfo_rooty(), y)}")
+
+        canvas = tk.Canvas(m, width=W, height=H, bg=BG_DESKTOP,
+                           highlightthickness=0, bd=0)
+        canvas.pack()
+        round_rect(canvas, 2, 2, W - 2, H - 2, 16, fill=MENU_BG, outline="#49525c")
+        inner = tk.Frame(canvas, bg=MENU_BG)
+        canvas.create_window(W // 2, H // 2, window=inner, width=W - 8, height=H - 8)
+
+        search_var = tk.StringVar(value=query)
+        self.start_search_var = search_var
+        search = tk.Entry(inner, textvariable=search_var, font=FONT, bd=0,
+                          bg="#1e2126", fg="white", insertbackground="white")
+        search.pack(fill="x", padx=24, pady=(18, 12), ipady=6)
+        tk.Label(inner, text="  Приложения", bg=MENU_BG, fg="#cdd3da",
+                 font=FONT_BOLD, anchor="w").pack(fill="x", padx=12)
+        grid = tk.Frame(inner, bg=MENU_BG)
+        grid.pack(fill="both", expand=True, padx=16, pady=8)
+        bottom = tk.Frame(inner, bg=MENU_BG)
+        bottom.pack(side="bottom", fill="x", padx=20, pady=12)
+        tk.Label(bottom, text=f"👤  {self.os.users.whoami()}",
+                 bg=MENU_BG, fg="#dfe4ea", font=FONT_BOLD).pack(side="left")
+        tk.Button(bottom, text="⏻", bg=MENU_BG, fg="#dfe4ea", bd=0, font=FONT_BOLD,
+                  activebackground="#ef4444", activeforeground="white",
+                  command=self.shutdown).pack(side="right")
+
+        state = {"cells": [], "empty": None}
+        quick = tk.Frame(inner, bg=MENU_BG)
+        quick.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Label(quick, text="Быстрый доступ", bg=MENU_BG, fg="#9fb3c8",
+                 font=FONT_BOLD).pack(side="left")
+        for key in ("computer", "device_manager", "settings"):
+            title, icon, opener = APPS[key]
+            tk.Button(quick, text=f"{icon} {title}", command=lambda o=opener: (self.close_start_menu(), o(self)),
+                      bg=MENU_BG, fg="#dfe4ea", bd=0, activebackground=MENU_HOVER).pack(side="left", padx=4)
+
+        def rebuild(*_):
+            q = search_var.get().strip().lower()
+            if not state["cells"]:
+                col = row = 0
+                for key, (title, icon, opener) in APPS.items():
+                    def launch(o=opener):
+                        self.close_start_menu()
+                        self.root.after(10, lambda: o(self))
+
+                    cell = tk.Button(
+                        grid, text=f"{icon}\n{title}", command=launch,
+                        bg=MENU_BG, fg="#dfe4ea", activebackground=MENU_HOVER,
+                        activeforeground="white", bd=0, relief="flat",
+                        highlightthickness=0, cursor="hand2", width=12, height=4,
+                        font=FONT, wraplength=120, justify="center")
+                    cell.grid(row=row, column=col, padx=4, pady=4,
+                              sticky="nsew")
+                    cell.bind("<Enter>",
+                              lambda e, btn=cell: self._paint_menu((btn,), MENU_HOVER))
+                    cell.bind("<Leave>",
+                              lambda e, btn=cell: self._paint_menu((btn,), MENU_BG))
+                    state["cells"].append((f"{key} {title}".lower(), cell))
+                    col += 1
+                    if col >= 4:
+                        col = 0
+                        row += 1
+            found = 0
+            for title_l, cell in state["cells"]:
+                if q and q not in title_l:
+                    cell.grid_remove()
+                else:
+                    cell.grid()
+                    found += 1
+            if state["empty"] is None:
+                state["empty"] = tk.Label(grid, text="Ничего не найдено",
+                                           bg=MENU_BG, fg="#9fb3c8", font=FONT)
+            if q and not found:
+                state["empty"].grid(row=0, column=0, columnspan=4, pady=20)
+            else:
+                state["empty"].grid_remove()
+
+        search_var.trace_add("write", rebuild)
+        rebuild()
+        m.bind("<FocusOut>",
+               lambda e: self.root.after(120, self._close_menu_if_unfocused))
+        m.bind("<Escape>", lambda e: self.close_start_menu())
+        self.start_menu = m
+        search.focus_set()
+
+    @staticmethod
+    def _paint_menu(widgets, color: str) -> None:
+        for wd in widgets:
+            try:
+                wd.config(bg=color)
+            except tk.TclError:
+                pass
+
+    def _close_menu_if_unfocused(self) -> None:
+        m = self.start_menu
+        if m is None:
+            return
+        try:
+            f = self.root.focus_get()
+            inside = f is not None and f.winfo_toplevel() is m
+        except (KeyError, tk.TclError):
+            inside = False
+        if not inside:
+            self.close_start_menu()
+
+    def notify(self, title: str, text: str) -> None:
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg="#2b2f36")
+        tw, th = 340, 84
+        x = self.root.winfo_rootx() + self.root.winfo_width() - tw - 16
+        y = self.root.winfo_rooty() + 16 + len(self._toasts) * (th + 10)
+        toast.geometry(f"{tw}x{th}+{x}+{y}")
+        tk.Label(toast, text=title, bg="#2b2f36", fg="#7dd3fc",
+                 font=FONT_BOLD, anchor="w").pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(toast, text=text, bg="#2b2f36", fg="#e0e6ed", font=FONT,
+                 anchor="w", wraplength=tw - 24, justify="left"
+                 ).pack(fill="both", expand=True, padx=12, pady=(2, 8))
+        toast.bind("<Button-1>", lambda e: self._dismiss(toast))
+        self._toasts.append(toast)
+        toast.after(4500, lambda: self._dismiss(toast))
+
+    def _dismiss(self, toast) -> None:
+        if toast in self._toasts:
+            self._toasts.remove(toast)
+        try:
+            toast.destroy()
+        except tk.TclError:
+            pass
+
+    def shutdown(self) -> None:
+        self.close_start_menu()
+        if messagebox.askyesno(VERSION, "Выключить PyOS?", parent=self.root):
+            self.os.shutdown()
+            self.root.destroy()
+
+    def tick(self) -> None:
+        try:
+            self.clock.config(
+                text=datetime.datetime.now().strftime("%H:%M:%S   %d.%m.%Y"))
+            self.root.after(1000, self.tick)
+        except tk.TclError:
+            pass
+
+
+# ============================================================
+#                    ЭКРАНЫ
+# ============================================================
+class BootScreen:
+    STEPS = [
+        "Загрузка ядра PyOS 3.0...",
+        "Инициализация виртуальной ФС...",
+        "Запуск диспетчера процессов...",
+        "Подключение пользователей...",
+        "Запуск планировщика...",
+        "Инициализация сети...",
+        "Загрузка пакетов...",
+        "Подготовка рабочего стола...",
+        "Добро пожаловать",
+    ]
+
+    def __init__(self, root, on_done) -> None:
+        self.on_done = on_done
+        self.top = tk.Toplevel(root)
+        self.top.overrideredirect(True)
+        self.top.configure(bg="black")
+        self.top.attributes("-topmost", True)
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        self.top.geometry(f"{w}x{h}+0+0")
+        box = tk.Frame(self.top, bg="black")
+        box.place(relx=0.5, rely=0.45, anchor="center")
+        tk.Label(box, text="🐍", bg="black", fg="#7dd3fc",
+                 font=("Segoe UI", 64)).pack()
+        tk.Label(box, text="PyOS", bg="black", fg="white",
+                 font=("Segoe UI", 42, "bold")).pack()
+        tk.Label(box, text=VERSION, bg="black", fg="#7a8a99",
+                 font=("Segoe UI", 12)).pack(pady=(0, 30))
+        self.welcome = tk.Label(box, text="", bg="black", fg="#7dd3fc",
+                                font=("Segoe UI", 24, "bold"))
+        self.welcome.pack(pady=(0, 18))
+        self.bar = ttk.Progressbar(box, length=460, mode="determinate",
+                                   maximum=len(self.STEPS))
+        self.bar.pack(pady=(0, 10))
+        self.msg = tk.Label(box, text="", bg="black", fg="#556677",
+                            font=("Consolas", 10))
+        self.msg.pack()
+        self.step = 0
+        self.top.after(400, self._next)
+
+    def _next(self) -> None:
+        if self.step >= len(self.STEPS):
+            self.top.after(500, self._finish)
+            return
+        text = self.STEPS[self.step]
+        self.bar["value"] = self.step + 1
+        self.msg.config(text=text)
+        if text == "Добро пожаловать":
+            self.welcome.config(text="Добро пожаловать!")
+        self.step += 1
+        self.top.after(random.randint(200, 500), self._next)
+
+    def _finish(self) -> None:
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+        self.on_done()
+
+
+class LoginScreen:
+    WEEKDAYS = ["понедельник", "вторник", "среда", "четверг",
+                "пятница", "суббота", "воскресенье"]
+    MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+    def __init__(self, root, kernel, on_done) -> None:
+        self.kernel = kernel
+        self.on_done = on_done
+        self.top = tk.Toplevel(root)
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        self.top.configure(bg="#0b1220")
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        self.top.geometry(f"{w}x{h}+0+0")
+        self.h = h
+        self._pw_frame = None
+        self._tiles_built = False
+
+        self.clock_lbl = tk.Label(self.top, bg="#0b1220", fg="white",
+                                  font=("Segoe UI", 64, "bold"))
+        self.clock_lbl.place(relx=0.5, y=int(h * 0.26), anchor="center")
+        self.date_lbl = tk.Label(self.top, bg="#0b1220", fg="#9fb3c8",
+                                 font=("Segoe UI", 20))
+        self.date_lbl.place(relx=0.5, y=int(h * 0.26) + 72, anchor="center")
+        self._tick()
+
+        tk.Label(self.top, text="Выберите пользователя", bg="#0b1220",
+                 fg="#7dd3fc", font=("Segoe UI", 14)
+                 ).place(relx=0.5, y=int(h * 0.52), anchor="center")
+        self.box = tk.Frame(self.top, bg="#0b1220")
+        self.box.place(relx=0.5, y=int(h * 0.64), anchor="center")
+        self.error = tk.Label(self.top, bg="#0b1220", fg="#ef4444", font=FONT)
+        self.error.place(relx=0.5, y=int(h * 0.64) + 130, anchor="center")
+        self._build_tiles()
+
+    def _tick(self) -> None:
+        try:
+            now = datetime.datetime.now()
+            self.clock_lbl.config(text=now.strftime("%H:%M"))
+            self.date_lbl.config(
+                text=f"{self.WEEKDAYS[now.weekday()]}, "
+                     f"{now.day} {self.MONTHS[now.month - 1]}")
+            self.top.after(1000, self._tick)
+        except tk.TclError:
+            pass
+
+    def _build_tiles(self) -> None:
+        if self._tiles_built:
+            return
+        self._tiles_built = True
+        for i, (name, info) in enumerate(self.kernel.users.users.items()):
+            avatar = "🛡" if info.role == "admin" else "👤"
+            tile = tk.Button(
+                self.box, text=f"{avatar}\n{name}", command=lambda n=name: self._pick(n),
+                bg="#16233a", fg="#cfe3ff", activebackground="#1f3252",
+                activeforeground="white", bd=0, relief="flat", cursor="hand2",
+                width=10, height=4, font=FONT_BOLD, justify="center")
+            tile.grid(row=0, column=i, padx=10)
+            tile.bind("<Enter>", lambda e, btn=tile: self._paint((btn,), "#1f3252"))
+            tile.bind("<Leave>", lambda e, btn=tile: self._paint((btn,), "#16233a"))
+
+    @staticmethod
+    def _paint(widgets, color):
+        for wd in widgets:
+            try:
+                wd.config(bg=color)
+            except tk.TclError:
+                pass
+
+    def _pick(self, name: str) -> None:
+        self.error.config(text="")
+        info = self.kernel.users.users[name]
+        if info.password_hash is None:
+            self._login(name, "")
+            return
+        if self._pw_frame is not None:
+            self._pw_frame.destroy()
+        self._pw_frame = tk.Frame(self.top, bg="#0b1220")
+        self._pw_frame.place(relx=0.5, y=int(self.h * 0.64), anchor="center")
+        tk.Label(self._pw_frame, text=f"🔑  {name}", bg="#0b1220",
+                 fg="#cfe3ff", font=FONT).pack()
+        entry = tk.Entry(self._pw_frame, show="•", font=FONT, bd=0,
+                         justify="center", bg="#16233a", fg="white",
+                         insertbackground="white")
+        entry.pack(pady=(10, 6), ipady=5)
+        actions = tk.Frame(self._pw_frame, bg="#0b1220")
+        actions.pack()
+        tk.Button(actions, text="Войти", command=lambda: self._login(name, entry.get()),
+                  bg=ACCENT, fg="white", activebackground=ACCENT_DARK,
+                  activeforeground="white", bd=0, padx=18, pady=5,
+                  font=FONT_BOLD).pack(side="left", padx=4)
+        tk.Button(actions, text="Отмена", command=self._clear_password,
+                  bg="#16233a", fg="#cfe3ff", activebackground="#1f3252",
+                  activeforeground="white", bd=0, padx=14, pady=5,
+                  font=FONT).pack(side="left", padx=4)
+        entry.bind("<Return>", lambda e: self._login(name, entry.get()))
+        entry.focus_set()
+
+    def _clear_password(self) -> None:
+        if self._pw_frame is not None:
+            self._pw_frame.destroy()
+            self._pw_frame = None
+        self.error.config(text="")
+
+    def _login(self, name: str, pwd: str) -> None:
+        ok, msg = self.kernel.users.login(name, pwd)
+        if ok:
+            try:
+                self.top.destroy()
+            except tk.TclError:
+                pass
+            self.on_done()
+        else:
+            self.error.config(text="✕ " + msg)
+            if self._pw_frame is not None:
+                self._pw_frame.destroy()
+                self._pw_frame = None
+
+
+class LockScreen:
+    def __init__(self, root, kernel) -> None:
+        self.kernel = kernel
+        self.top = tk.Toplevel(root)
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        self.top.configure(bg="#0b1220")
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        self.top.geometry(f"{w}x{h}+0+0")
+        tk.Label(self.top, text=datetime.datetime.now().strftime("%H:%M"),
+                 bg="#0b1220", fg="white", font=("Segoe UI", 72, "bold")
+                 ).place(relx=0.5, rely=0.35, anchor="center")
+        tk.Label(self.top, text="🔒  Заблокировано", bg="#0b1220", fg="#7dd3fc",
+                 font=("Segoe UI", 18)).place(relx=0.5, rely=0.55, anchor="center")
+        entry = tk.Entry(self.top, show="•", font=FONT, bd=0, justify="center",
+                         bg="#16233a", fg="white", insertbackground="white")
+        entry.place(relx=0.5, rely=0.65, anchor="center", width=240, height=32)
+        entry.focus_set()
+
+        def unlock(event=None):
+            u = self.kernel.users.users[self.kernel.users.current]
+            if (u.password_hash is None
+                    or self.kernel.users._h(entry.get()) == u.password_hash):
+                self.top.destroy()
+            else:
+                entry.delete(0, "end")
+
+        entry.bind("<Return>", unlock)
+
+
+# ============================================================
+#                    ЗАПУСК
+# ============================================================
+def run_gui() -> bool:
+    if tk is None:
+        print("tkinter не установлен — запускаю CLI.")
+        return False
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print(f"Нет графического дисплея ({e}) — запускаю CLI.")
+        return False
+    kernel = Kernel()
+    kernel.start_autosave()
+
+    def open_desktop() -> None:
+        root.deiconify()
+        Desktop(root, kernel)
+        if kernel.desktop_notify:
+            kernel.desktop_notify("PyOS",
+                                  f"Добро пожаловать, {kernel.users.whoami()}!")
+
+    def after_boot() -> None:
+        if "--nologin" in sys.argv:
+            open_desktop()
+        else:
+            LoginScreen(root, kernel, open_desktop)
+
+    if "--noboot" in sys.argv:
+        if "--nologin" in sys.argv:
+            Desktop(root, kernel)
+        else:
+            root.withdraw()
+            LoginScreen(root, kernel, open_desktop)
+    else:
+        root.withdraw()
+        BootScreen(root, after_boot)
+
+    if "--webserver" in sys.argv:
+        _start_webserver(kernel)
+
+    root.mainloop()
+    kernel.shutdown()
+    return True
+
+
+def _start_webserver(kernel: Kernel) -> None:
+    """Реальный HTTP-сервер на 127.0.0.1:8080, отдающий /public из VFS."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = "/public" + (self.path if self.path != "/" else "/index.html")
+            try:
+                content = kernel.vfs.read(path).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(content)
+            except VFSError:
+                self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    def serve():
+        try:
+            srv = http.server.HTTPServer(("127.0.0.1", 8080), Handler)
+            srv.serve_forever()
+        except OSError:
+            pass
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+
+
+def main() -> None:
+    if "--cli" in sys.argv or not run_gui():
+        kernel = Kernel()
+        kernel.start_autosave()
+        try:
+            kernel.shell.repl()
+        finally:
+            kernel.shutdown()
+
+
+if __name__ == "__main__":
+    main()
